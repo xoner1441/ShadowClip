@@ -216,3 +216,40 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ShadowClip build and release output
+/outputs/
+/.agents/
+/.codex/
+/work/pyinstaller-build-*/
+/work/pyinstaller-build/
+/work/pyinstaller-dist-*/
+/work/pyinstaller-spec-*/
+/work/pyinstaller-work*/
+/work/pyinstaller-hooks/
+/work/release-generated-*/
+/work/shadowclip-build-venv/
+
+# Bundled third-party runtimes are release inputs, not source history
+/work/obs-runtime/
+/work/obs-runtime-download/
+/work/installer/innosetup-*.exe
+/work/ShadowClip/tools/ffmpeg/
+
+# Local experiments and generated media
+/work/*-test*/
+/work/*-test-output/
+/work/bom-config-test.json
+/work/vendor_stdlib/
+/work/*.zip
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.pdb
+
+# Local editor state
+.idea/
+.vscode/
+Thumbs.db
