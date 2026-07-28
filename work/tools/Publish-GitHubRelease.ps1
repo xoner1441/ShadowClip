@@ -53,6 +53,7 @@ function Invoke-GitHubRaw {
 
     Add-Type -AssemblyName System.Net.Http
     $client = [Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromMinutes(30)
     $stream = $null
     $content = $null
     $request = $null
