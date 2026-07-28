@@ -51,7 +51,56 @@ function Invoke-GitHubRaw {
         [string]$Path
     )
 
-    Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/octet-stream" -InFile $Path
+    Add-Type -AssemblyName System.Net.Http
+    $client = [Net.Http.HttpClient]::new()
+    $stream = $null
+    $content = $null
+    $request = $null
+    $response = $null
+    try {
+        foreach ($entry in $Headers.GetEnumerator()) {
+            [void]$client.DefaultRequestHeaders.TryAddWithoutValidation(
+                [string]$entry.Key,
+                [string]$entry.Value
+            )
+        }
+        $stream = [IO.File]::OpenRead($Path)
+        $content = [Net.Http.StreamContent]::new($stream, 1024 * 1024)
+        $content.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new(
+            "application/octet-stream"
+        )
+        $request = [Net.Http.HttpRequestMessage]::new(
+            [Net.Http.HttpMethod]::new($Method),
+            $Uri
+        )
+        $request.Content = $content
+        $response = $client.SendAsync(
+            $request,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead
+        ).GetAwaiter().GetResult()
+        $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw "GitHub asset upload failed: HTTP $([int]$response.StatusCode) $responseBody"
+        }
+        if ($responseBody) {
+            return $responseBody | ConvertFrom-Json
+        }
+    }
+    finally {
+        if ($response) {
+            $response.Dispose()
+        }
+        if ($request) {
+            $request.Dispose()
+        }
+        elseif ($content) {
+            $content.Dispose()
+        }
+        elseif ($stream) {
+            $stream.Dispose()
+        }
+        $client.Dispose()
+    }
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -101,11 +150,12 @@ catch {
 
 if (-not $release) {
     $release = Invoke-GitHubJson -Method Post -Uri "$apiBase/releases" -Headers $headers -Body @{
-        tag_name   = $tagName
-        name       = $releaseName
-        body       = $releaseBody
-        draft      = [bool]$Draft
-        prerelease = [bool]$Prerelease
+        tag_name         = $tagName
+        target_commitish = "main"
+        name             = $releaseName
+        body             = $releaseBody
+        draft            = [bool]$Draft
+        prerelease       = [bool]$Prerelease
     }
     Write-Host "Created release: $tagName"
 }
@@ -128,14 +178,14 @@ foreach ($existing in $assets) {
 }
 
 $uploadBase = ($release.upload_url -replace "\{\?name,label\}$", "")
-$uploadUri = "$uploadBase?name=$([uri]::EscapeDataString($assetName))"
+$uploadUri = "${uploadBase}?name=$([uri]::EscapeDataString($assetName))"
 Invoke-GitHubRaw -Method Post -Uri $uploadUri -Headers $headers -Path $asset.Path | Out-Null
 Write-Host "Uploaded asset: $assetName"
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.Path).Hash
 $shaPath = Join-Path ([IO.Path]::GetTempPath()) "$assetName.sha256"
 "$hash  $assetName" | Set-Content -LiteralPath $shaPath -Encoding ASCII
-$shaUploadUri = "$uploadBase?name=$([uri]::EscapeDataString("$assetName.sha256"))"
+$shaUploadUri = "${uploadBase}?name=$([uri]::EscapeDataString("$assetName.sha256"))"
 Invoke-GitHubRaw -Method Post -Uri $shaUploadUri -Headers $headers -Path $shaPath | Out-Null
 Write-Host "Uploaded asset: $assetName.sha256"
 
