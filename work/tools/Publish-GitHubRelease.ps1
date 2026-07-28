@@ -119,7 +119,7 @@ $notes = Resolve-Path -LiteralPath $ReleaseNotesPath
 $assetName = Split-Path -Leaf $asset.Path
 $tagName = "v$Version"
 $releaseName = "ShadowClip $Version"
-$releaseBody = Get-Content -LiteralPath $notes.Path -Raw -Encoding UTF8
+$releaseBody = [IO.File]::ReadAllText($notes.Path, [Text.Encoding]::UTF8)
 
 $token = $env:GITHUB_TOKEN
 if (-not $token) {
