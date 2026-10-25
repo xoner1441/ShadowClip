@@ -1,6 +1,6 @@
 param(
-    [string]$Version = "0.1.23-rc9",
-    [string]$VersionNumeric = "0.1.23.9",
+    [string]$Version = "0.1.23-rc10",
+    [string]$VersionNumeric = "0.1.23.10",
     [string]$ReleaseDir,
     [string]$OutputDir
 )

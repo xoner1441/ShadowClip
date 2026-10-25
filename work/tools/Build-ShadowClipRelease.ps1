@@ -1,6 +1,6 @@
 param(
-    [string]$Version = "0.1.23-rc9",
-    [string]$VersionNumeric = "0.1.23.9",
+    [string]$Version = "0.1.23-rc10",
+    [string]$VersionNumeric = "0.1.23.10",
     [switch]$Force,
     [switch]$SkipInstaller
 )
@@ -76,7 +76,7 @@ if ($sourceVersionMatch.Matches.Groups[1].Value -ne $Version) {
 
 $numericParts = @($VersionNumeric.Split(".") | ForEach-Object { [int]$_ })
 if ($numericParts.Count -ne 4) {
-    throw "VersionNumeric must contain four numeric parts, for example 0.1.23.9."
+    throw "VersionNumeric must contain four numeric parts, for example 0.1.23.10."
 }
 
 Reset-BuildDirectory -Path $buildDir -AllowedRoot $workRoot

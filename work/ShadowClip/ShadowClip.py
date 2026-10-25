@@ -40,7 +40,7 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.23-rc9"
+APP_VERSION = "0.1.23-rc10"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_PREFIX = "ShadowClipSetup"
@@ -923,6 +923,7 @@ WS_EX_CLIENTEDGE = 0x00000200
 WS_EX_WINDOWEDGE = 0x00000100
 HWND_TOP = wintypes.HWND(0)
 HWND_TOPMOST = wintypes.HWND(-1)
+SW_SHOWNORMAL = 1
 SW_SHOWNOACTIVATE = 4
 SW_RESTORE = 9
 SWP_NOSIZE = 0x0001
@@ -1672,6 +1673,43 @@ def unique_destination_path(path):
         if not candidate.exists():
             return candidate
     return path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
+
+
+def explorer_select_parameters(path):
+    resolved = Path(path).resolve()
+    return f'/select,"{resolved}"'
+
+
+def reveal_file_in_explorer(path):
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    if os.name != "nt":
+        raise OSError("Explorer file selection is only available on Windows")
+    explorer = Path(os.environ.get("WINDIR", r"C:\Windows")) / "explorer.exe"
+    parameters = explorer_select_parameters(path)
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+    ]
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    result = shell32.ShellExecuteW(
+        None,
+        "open",
+        str(explorer),
+        parameters,
+        str(path.parent),
+        SW_SHOWNORMAL,
+    )
+    result_code = int(result or 0)
+    if result_code <= 32:
+        raise OSError(result_code, "Windows Explorer could not select the media file")
+    return parameters
 
 
 def clamp_trim_range(start_seconds, end_seconds, duration_seconds, minimum_duration=0.25):
@@ -12155,17 +12193,19 @@ class ShadowClipApp:
         self.threadsafe_log(f"Opened clip: {clip}")
 
     def reveal_clip_path(self, clip):
-        clip = Path(clip)
+        clip = Path(clip).resolve()
         if not clip.exists():
             self.threadsafe_log(f"Clip not found: {clip}")
             return
-        subprocess.Popen(
-            ["explorer", f"/select,{clip}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        self.threadsafe_log(f"Showing clip: {clip}")
+        try:
+            reveal_file_in_explorer(clip)
+            self.threadsafe_log(f"Showing clip: {clip}")
+        except Exception as exc:
+            try:
+                os.startfile(str(clip.parent))
+                self.threadsafe_log(f"Opened clip folder after Explorer selection failed: {clip.parent} ({exc})")
+            except OSError as fallback_exc:
+                self.threadsafe_log(f"Could not show clip in Explorer: {fallback_exc}")
 
     def auto_start_replay(self):
         if self.replay_running():
@@ -12368,6 +12408,13 @@ class ShadowClipApp:
         except tk.TclError:
             return
         self.set_window_game_overlay_style(window, click_through=click_through)
+        try:
+            # Tk must leave the withdrawn state before native no-activate calls
+            # can keep a newly-created toast or status icon visible.
+            window.deiconify()
+            window.update_idletasks()
+        except tk.TclError:
+            return
         if os.name == "nt":
             try:
                 ctypes.windll.user32.ShowWindow(wintypes.HWND(window.winfo_id()), SW_SHOWNOACTIVATE)
@@ -13714,7 +13761,13 @@ class ShadowClipApp:
 
     def show_event_toast(self, title, detail="", icon_key="record"):
         if self.root.winfo_exists():
-            self.root.after(0, lambda: self._show_event_toast(title, detail, icon_key))
+            def display_toast():
+                try:
+                    self._show_event_toast(title, detail, icon_key)
+                except Exception as exc:
+                    self.threadsafe_log(f"Toast display failed: {exc}")
+
+            self.root.after(0, display_toast)
 
     def _show_event_toast(self, title, detail="", icon_key="record"):
         self.play_event_sound(icon_key)

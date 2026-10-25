@@ -196,11 +196,51 @@ class ReleaseLogicTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             clip = Path(temporary_directory) / "Game Clip.mp4"
             clip.write_bytes(b"clip")
-            with mock.patch.object(SHADOWCLIP.subprocess, "Popen") as popen:
+            with mock.patch.object(SHADOWCLIP, "reveal_file_in_explorer") as reveal:
                 app.reveal_clip_path(clip)
-        command = popen.call_args.args[0]
-        self.assertEqual(command[0], "explorer")
-        self.assertEqual(command[1], f"/select,{clip}")
+                reveal.assert_called_once_with(clip.resolve())
+
+    def test_explorer_select_parameters_quote_paths_with_spaces(self):
+        path = Path(r"F:\ShadowClip\Game Name\Game Clip.mp4")
+        self.assertEqual(
+            SHADOWCLIP.explorer_select_parameters(path),
+            f'/select,"{path.resolve()}"',
+        )
+
+    def test_new_capture_feedback_windows_leave_withdrawn_state(self):
+        root = SHADOWCLIP.tk.Tk()
+        root.withdraw()
+        app = object.__new__(SHADOWCLIP.ShadowClipApp)
+        app.root = root
+        app.event_toast = None
+        app.event_toast_after_ids = []
+        app.recording_indicator = None
+        app.recording_indicator_state = None
+        app.noactivate_window_procs = {}
+        app.play_event_sound = mock.Mock()
+        app.threadsafe_log = mock.Mock()
+        app.toast_duration_ms = lambda: 10_000
+        app.toast_position = lambda: "top_right"
+        app.current_overlay_bounds = lambda: {
+            "left": 0,
+            "top": 0,
+            "width": 1280,
+            "height": 720,
+        }
+        app.replay_running = lambda: True
+        app.recording_running = lambda: False
+        app.recording_indicator_enabled = lambda: True
+        app.set_window_game_overlay_style = mock.Mock()
+        try:
+            with mock.patch.object(SHADOWCLIP.os, "name", "posix"):
+                app._show_event_toast("Clip saved", "Replay clip was saved.", "clip")
+                app.update_recording_indicator()
+                root.update()
+            self.assertNotEqual(app.event_toast.state(), "withdrawn")
+            self.assertNotEqual(app.recording_indicator.state(), "withdrawn")
+            self.assertEqual(app.recording_indicator_state, (True, False))
+        finally:
+            root.destroy()
 
     def test_gallery_search_and_filter_controls_remain_available(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
