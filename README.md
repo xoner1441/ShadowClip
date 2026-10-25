@@ -7,7 +7,7 @@ ShadowClip is a Windows replay buffer and clip recorder with a bundled private O
 - Application: `work/ShadowClip/ShadowClip.py`
 - Installer: `work/installer`
 - Release tools and tests: `work/tools` and `work/tests`
-- Current release notes: `work/ShadowClip/RELEASE_NOTES_0.1.23-rc10.md`
+- Current release notes: `work/ShadowClip/RELEASE_NOTES_0.1.23-rc11.md`
 
 OBS and FFmpeg binaries, local build environments, generated packages, and installers are intentionally excluded from Git history. Public release installers must retain `THIRD_PARTY_NOTICES.md` and the bundled license files.
 

@@ -40,7 +40,7 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.23-rc10"
+APP_VERSION = "0.1.23-rc11"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_PREFIX = "ShadowClipSetup"
@@ -13786,8 +13786,8 @@ class ShadowClipApp:
         except tk.TclError:
             pass
 
-        width = 68
-        height = 68
+        width = 338
+        height = 74
         bounds = self.current_overlay_bounds()
         screen_w = bounds["width"]
         screen_h = bounds["height"]
@@ -13802,17 +13802,45 @@ class ShadowClipApp:
         frame = tk.Frame(
             toast,
             bg="#090d0b",
-            width=58,
-            height=58,
+            width=328,
+            height=64,
             highlightbackground="#32402d",
             highlightthickness=1,
         )
-        frame.place(x=5, y=5, width=58, height=58)
+        frame.place(x=5, y=5, width=328, height=64)
         visual_key, color = FEEDBACK_ICON_STYLES.get(icon_key, FEEDBACK_ICON_STYLES["warning"])
-        icon = tk.Canvas(frame, width=40, height=40, bg="#090d0b", highlightthickness=0, bd=0)
-        icon.place(relx=0.5, rely=0.5, anchor="center")
-        self.draw_dashboard_icon(icon, visual_key, 40, color)
-        toast._shadowclip_feedback = (title, detail, icon)
+        accent = tk.Frame(frame, bg=color, width=4)
+        accent.pack(side="left", fill="y")
+        icon = tk.Canvas(frame, width=38, height=38, bg="#090d0b", highlightthickness=0, bd=0)
+        icon.pack(side="left", padx=(14, 12))
+        self.draw_dashboard_icon(icon, visual_key, 38, color)
+        text = tk.Frame(frame, bg="#090d0b")
+        text.pack(side="left", fill="both", expand=True, padx=(0, 16), pady=(10, 9))
+        title_label = tk.Label(
+            text,
+            text=title,
+            bg="#090d0b",
+            fg="#f4f7fb",
+            anchor="w",
+            font=("Segoe UI", 10, "bold"),
+        )
+        title_label.pack(fill="x")
+        detail_label = tk.Label(
+            text,
+            text=detail,
+            bg="#090d0b",
+            fg="#aeb8c6",
+            anchor="w",
+            font=("Segoe UI", 8),
+        )
+        detail_label.pack(fill="x", pady=(3, 0))
+        toast._shadowclip_feedback = {
+            "title": title,
+            "detail": detail,
+            "icon": icon,
+            "title_label": title_label,
+            "detail_label": detail_label,
+        }
 
         self.keep_game_overlay_visible(toast, click_through=True, attempts=7, delay_ms=120)
         self.event_toast_after_ids.append(self.root.after(self.toast_duration_ms(), lambda: self.fade_event_toast(0.96)))
@@ -14171,7 +14199,7 @@ class ShadowClipApp:
         indicator.configure(bg=transparent)
         indicator.attributes("-topmost", True)
         try:
-            indicator.attributes("-alpha", 0.92)
+            indicator.attributes("-alpha", 0.70)
             if os.name == "nt":
                 indicator.attributes("-transparentcolor", transparent)
         except tk.TclError:
@@ -14186,7 +14214,7 @@ class ShadowClipApp:
         for index, (icon_key, color) in enumerate(states):
             tile = tk.Frame(
                 row,
-                bg="#090d0b",
+                bg="#070a08",
                 width=50,
                 height=50,
                 highlightbackground="#32402d" if icon_key == "replay" else "#553039",
@@ -14194,7 +14222,7 @@ class ShadowClipApp:
             )
             tile.pack(side="left", padx=(0 if index == 0 else 8, 0))
             tile.pack_propagate(False)
-            canvas = tk.Canvas(tile, width=30, height=30, bg="#090d0b", highlightthickness=0, bd=0)
+            canvas = tk.Canvas(tile, width=30, height=30, bg="#070a08", highlightthickness=0, bd=0)
             canvas.place(relx=0.5, rely=0.5, anchor="center")
             self.draw_dashboard_icon(canvas, icon_key, 30, color)
         indicator._shadowclip_status_icons = states
@@ -14264,11 +14292,11 @@ class ShadowClipApp:
                 self.update_tray_status()
             if message == "Replay buffer started.":
                 self.notify_user("Replay started", "Replay buffer is running.")
-                self.show_event_toast("Instant Replay is on", "Replay buffer is running.", "replay")
+                self.show_event_toast("Instant Replay started", "Replay capture is now active.", "replay")
                 self.update_recording_indicator()
             elif message == "Stopped replay.":
                 self.notify_user("Replay stopped", "Replay buffer stopped.")
-                self.show_event_toast("Instant Replay is off", "Replay buffer stopped.", "stop")
+                self.show_event_toast("Instant Replay stopped", "Replay capture is now inactive.", "stop")
                 self.update_recording_indicator()
             elif message.startswith("Recording started:"):
                 self.notify_user("Recording started", message)

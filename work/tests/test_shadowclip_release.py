@@ -238,6 +238,16 @@ class ReleaseLogicTests(unittest.TestCase):
                 root.update()
             self.assertNotEqual(app.event_toast.state(), "withdrawn")
             self.assertNotEqual(app.recording_indicator.state(), "withdrawn")
+            self.assertGreater(app.event_toast.winfo_width(), 300)
+            self.assertEqual(
+                app.event_toast._shadowclip_feedback["title"],
+                "Clip saved",
+            )
+            self.assertAlmostEqual(
+                float(app.recording_indicator.attributes("-alpha")),
+                0.70,
+                places=2,
+            )
             self.assertEqual(app.recording_indicator_state, (True, False))
         finally:
             root.destroy()
