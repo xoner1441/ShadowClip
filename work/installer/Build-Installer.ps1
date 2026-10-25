@@ -1,6 +1,6 @@
 param(
-    [string]$Version = "0.1.22",
-    [string]$VersionNumeric = "0.1.22.0",
+    [string]$Version = "0.1.23-rc9",
+    [string]$VersionNumeric = "0.1.23.9",
     [string]$ReleaseDir,
     [string]$OutputDir
 )
@@ -32,6 +32,10 @@ $required = @(
     "ShadowClip.py",
     "assets\icons\home_34_accent.png",
     "assets\icons\replay_48_accent.png",
+    "assets\sounds\pulse_deep_clip.wav",
+    "assets\sounds\pulse_deep_start.wav",
+    "assets\sounds\pulse_deep_stop.wav",
+    "assets\sounds\pulse_deep_warning.wav",
     "tools\ffmpeg\bin\ffmpeg.exe",
     "tools\ffmpeg\LICENSE",
     "tools\obs\bin\64bit\obs64.exe",

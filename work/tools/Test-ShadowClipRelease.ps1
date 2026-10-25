@@ -1,6 +1,6 @@
 param(
-    [string]$Version = "0.1.22",
-    [string]$VersionNumeric = "0.1.22.0",
+    [string]$Version = "0.1.23-rc9",
+    [string]$VersionNumeric = "0.1.23.9",
     [string]$ReleaseDir,
     [string]$InstallerPath,
     [string]$ReportPath
@@ -42,6 +42,8 @@ $defaultConfig = Get-Content -LiteralPath $defaultConfigPath -Raw -Encoding UTF8
 Assert-ReleaseCondition (-not [bool]$defaultConfig.setup_completed) "Fresh-install config must not skip the setup wizard."
 Assert-ReleaseCondition ([string]::IsNullOrWhiteSpace([string]$defaultConfig.beta_install_id)) "Fresh-install config contains a fixed beta install ID."
 Assert-ReleaseCondition ([bool]$defaultConfig.check_updates_on_start) "Fresh-install update checks should be enabled."
+Assert-ReleaseCondition ([bool]$defaultConfig.capture_desktop_overlays) "Fresh installs must enable desktop-overlay capture."
+Assert-ReleaseCondition ([bool]$defaultConfig.capture_desktop_overlays_migrated) "Fresh-install overlay migration marker is missing."
 
 $result = [ordered]@{
     version = $Version
@@ -70,6 +72,10 @@ if ($ReleaseDir) {
         "shadowclip.config.json",
         "assets\icons\home_34_accent.png",
         "assets\icons\replay_48_accent.png",
+        "assets\sounds\pulse_deep_clip.wav",
+        "assets\sounds\pulse_deep_start.wav",
+        "assets\sounds\pulse_deep_stop.wav",
+        "assets\sounds\pulse_deep_warning.wav",
         "tools\ffmpeg\bin\ffmpeg.exe",
         "tools\ffmpeg\bin\ffprobe.exe",
         "tools\ffmpeg\LICENSE",
@@ -88,6 +94,8 @@ if ($ReleaseDir) {
     $portableConfig = Get-Content -LiteralPath (Join-Path $ReleaseDir "shadowclip.config.json") -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-ReleaseCondition (-not [bool]$portableConfig.setup_completed) "Portable config must open the setup wizard."
     Assert-ReleaseCondition ([string]::IsNullOrWhiteSpace([string]$portableConfig.beta_install_id)) "Portable config contains a fixed beta install ID."
+    Assert-ReleaseCondition ([bool]$portableConfig.capture_desktop_overlays) "Portable config must enable desktop-overlay capture."
+    Assert-ReleaseCondition ([bool]$portableConfig.capture_desktop_overlays_migrated) "Portable overlay migration marker is missing."
 
     $forbiddenFiles = @(
         Get-ChildItem -LiteralPath $ReleaseDir -File -Recurse -Filter "*.pdb"

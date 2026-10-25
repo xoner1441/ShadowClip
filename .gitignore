@@ -247,6 +247,7 @@ __marimo__/
 *.mov
 *.webm
 *.wav
+!work/ShadowClip/assets/sounds/*.wav
 *.pdb
 
 # Local editor state

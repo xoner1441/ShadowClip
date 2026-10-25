@@ -38,7 +38,9 @@ ShadowClip is a Windows clip recorder MVP. It records the full desktop, one moni
 - Windows autostart option, launching minimized to tray
 - Open the last clip or reveal it in Explorer from the app or tray menu
 - Built-in clip library with generated video thumbnails, game/app and media-type filters, search, date/name/size sorting, and incremental loading
-- Open, reveal, rename, or move saved clips and recordings to the Windows Recycle Bin directly in ShadowClip
+- Integrated clip editor with start/end previews, timeline trimming, lossless fast export, frame-accurate export, and optional original-file replacement
+- Open, edit, reveal, rename, or move saved clips and recordings to the Windows Recycle Bin directly in ShadowClip
+- Faster clip completion through immediate OBS save detection and non-blocking storage cleanup
 - In-HUD clip gallery with recent clips, play buttons, reveal buttons, and a `Play Last` action
 - Live normal-recording timer and file size in the control center, HUD recording tile, and optional bottom-right REC indicator
 - Optional game/app folders for clips and recordings, similar to ShadowPlay's game grouping
@@ -79,7 +81,7 @@ Enable `Start replay on launch` if ShadowClip should begin buffering automatical
 Enable `Check updates on launch` to let ShadowClip look for newer GitHub releases on startup. Downloads and installation always require confirmation.
 Updater installs run in a quiet update-safe mode: ShadowClip stops capture, closes, waits for the installer to finish, waits a few seconds more, then relaunches. This avoids first-start races with PyInstaller's temporary runtime extraction.
 
-The main desktop window uses a dark Control Center layout with sidebar pages for the core workflow, clip library, capture/video/audio settings, HUD and hotkeys, storage, updates, and logs. The `Clips` page scans supported video files below the output folder, including OBS `Replay` files and normal recordings. Preview images and media metadata are generated in the background so large libraries remain responsive.
+The main desktop window uses a dark Control Center layout with sidebar pages for the core workflow, clip library, capture/video/audio settings, HUD and hotkeys, storage, updates, and logs. The `Clips` page scans supported video files below the output folder, including OBS `Replay` files and normal recordings. Preview images and media metadata are generated in the background so large libraries remain responsive. Use `Edit` on a gallery card or the Home last-clip panel to trim a clip without another application. Fast mode preserves the original encoded streams; frame-accurate mode is available when an exact frame boundary matters.
 
 Capture, Video, Audio, HUD, Storage, Updates, Logs, and Hotkeys use grouped dark settings panels with consistent controls. Settings pages show when changes have not been saved. The Storage page scrolls with the mouse wheel anywhere over its content when the window is too short to show every option.
 

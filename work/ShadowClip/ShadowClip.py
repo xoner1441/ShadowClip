@@ -40,10 +40,25 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.22"
+APP_VERSION = "0.1.23-rc9"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_PREFIX = "ShadowClipSetup"
+EVENT_SOUND_FILES = {
+    "clip": "assets/sounds/pulse_deep_clip.wav",
+    "record": "assets/sounds/pulse_deep_start.wav",
+    "replay": "assets/sounds/pulse_deep_start.wav",
+    "stop": "assets/sounds/pulse_deep_stop.wav",
+    "warning": "assets/sounds/pulse_deep_warning.wav",
+}
+FEEDBACK_ICON_STYLES = {
+    "clip": ("clapper", "#80d51a"),
+    "record": ("record", "#ff4f64"),
+    "replay": ("replay", "#80d51a"),
+    "stop": ("check", "#d7dde7"),
+    "warning": ("logs", "#ffbd4a"),
+    "check": ("check", "#80d51a"),
+}
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
 else:
@@ -386,7 +401,8 @@ DEFAULT_CONFIG = {
     "capture_mode": "desktop_all",
     "capture_backend": "obs",
     "obs_minecraft_capture_mode": "specific_game",
-    "capture_desktop_overlays": False,
+    "capture_desktop_overlays": True,
+    "capture_desktop_overlays_migrated": True,
     "monitor_index": 0,
     "window_title": "",
     "framerate": 60,
@@ -435,15 +451,6 @@ DEFAULT_CONFIG = {
         "toggle_overlay": "F8",
         "make_borderless": "F12"
     }
-}
-
-
-LEGACY_DEFAULT_HOTKEYS = {
-    "save_clip": "Alt+F9",
-    "toggle_replay": "Alt+P",
-    "toggle_recording": "Alt+F1",
-    "toggle_overlay": "Alt+Z",
-    "make_borderless": "Alt+F2",
 }
 
 
@@ -741,16 +748,6 @@ def normalize_hotkey_config(hotkeys):
     for action, _label in HOTKEY_ACTIONS:
         normalized[action] = parse_hotkey_text(source.get(action, DEFAULT_CONFIG["hotkeys"][action]))[2]
     return normalized
-
-
-def migrate_legacy_default_hotkeys(hotkeys):
-    migrated = dict(hotkeys or {})
-    changed = False
-    for action, legacy_value in LEGACY_DEFAULT_HOTKEYS.items():
-        if str(migrated.get(action, "")).strip() == legacy_value:
-            migrated[action] = DEFAULT_CONFIG["hotkeys"][action]
-            changed = True
-    return migrated, changed
 
 
 ICONS = {
@@ -1559,6 +1556,7 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
 def load_config():
     config = DEFAULT_CONFIG.copy()
     config["hotkeys"] = DEFAULT_CONFIG["hotkeys"].copy()
+    user_config = {}
     if CONFIG_PATH.exists():
         try:
             with CONFIG_PATH.open("r", encoding="utf-8-sig") as handle:
@@ -1570,6 +1568,9 @@ def load_config():
                     config[key] = value
         except Exception:
             pass
+    if "capture_desktop_overlays_migrated" not in user_config:
+        config["capture_desktop_overlays"] = True
+        config["capture_desktop_overlays_migrated"] = True
     if config.get("audio_mode") == "dshow" and config.get("audio_device") and not config.get("mic_device"):
         config["mic_enabled"] = True
         config["mic_device"] = config["audio_device"]
@@ -1577,7 +1578,6 @@ def load_config():
     if not re.fullmatch(r"SC-[0-9A-F]{12}", beta_install_id):
         beta_install_id = f"SC-{uuid.uuid4().hex[:12].upper()}"
     config["beta_install_id"] = beta_install_id
-    config["hotkeys"], _hotkeys_migrated = migrate_legacy_default_hotkeys(config.get("hotkeys", {}))
     return config
 
 
@@ -1672,6 +1672,38 @@ def unique_destination_path(path):
         if not candidate.exists():
             return candidate
     return path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
+
+
+def clamp_trim_range(start_seconds, end_seconds, duration_seconds, minimum_duration=0.25):
+    duration = max(float(duration_seconds or 0), 0.0)
+    minimum = max(float(minimum_duration or 0), 0.01)
+    start = max(0.0, min(float(start_seconds or 0), duration))
+    end = max(0.0, min(float(end_seconds or 0), duration))
+    if duration <= minimum:
+        return 0.0, duration
+    if end - start < minimum:
+        if start + minimum <= duration:
+            end = start + minimum
+        else:
+            end = duration
+            start = max(0.0, end - minimum)
+    return start, end
+
+
+def format_precise_duration(seconds):
+    total_milliseconds = max(0, int(round(float(seconds or 0) * 1000)))
+    milliseconds = total_milliseconds % 1000
+    total_seconds = total_milliseconds // 1000
+    minutes, sec = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}.{milliseconds:03d}"
+    return f"{minutes:02d}:{sec:02d}.{milliseconds:03d}"
+
+
+def trimmed_copy_path(path):
+    path = Path(path)
+    return unique_destination_path(path.with_name(f"{path.stem} - Trimmed{path.suffix}"))
 
 
 def parse_audio_segment_times(path):
@@ -2487,6 +2519,9 @@ class FfmpegManager:
         self.gpu_adapter_names_cache = None
         self.ddagrab_cache = None
         self.save_lock = threading.Lock()
+        self.storage_cleanup_lock = threading.Lock()
+        self.storage_cleanup_running = False
+        self.last_storage_cleanup_at = 0.0
         self.last_clip_saved_at = 0.0
         self.last_clip_path = None
         self.recording_started_at = None
@@ -2524,7 +2559,9 @@ class FfmpegManager:
             self.encoder_cache = None
             self.encoder_log_signature = None
             self.ffmpeg_encoder_names_cache = None
-        if bool(old_config.get("capture_desktop_overlays", False)) != bool(config.get("capture_desktop_overlays", False)):
+        if bool(old_config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])) != bool(
+            config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])
+        ):
             self.obs_capture_context_key = ""
             self.obs_capture_strategy = "auto"
             self.obs_capture_strategy_cache.clear()
@@ -3161,7 +3198,11 @@ PeakMeterType=0
             # Minecraft's reconnecting OpenGL hook are probed together.
             self.obs_capture_strategy = "game_only"
         else:
-            default_strategy = "overlay_wgc" if bool(self.config.get("capture_desktop_overlays", False)) else "auto"
+            default_strategy = (
+                "overlay_wgc"
+                if bool(self.config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"]))
+                else "auto"
+            )
             self.obs_capture_strategy = self.obs_capture_strategy_cache.get(identity, default_strategy)
         self.obs_capture_strategy_changed_at = time.time()
         self.obs_capture_last_probe_at = 0.0
@@ -3794,7 +3835,7 @@ PeakMeterType=0
                     break
             except Exception:
                 pass
-            time.sleep(0.25)
+            time.sleep(0.1)
         if not saved_path:
             raise RuntimeError("OBS did not report a saved replay path.")
 
@@ -3802,8 +3843,8 @@ PeakMeterType=0
         self.last_clip_path = output
         now = time.time()
         self.last_clip_saved_at = now
-        self.cleanup_output_storage()
         self.log(f"Clip saved (OBS replay): {output}")
+        self.schedule_output_storage_cleanup()
         if bool(self.config.get("reset_replay_after_clip", True)):
             try:
                 self.reset_obs_replay_buffer(client)
@@ -3873,7 +3914,7 @@ PeakMeterType=0
         if output_path:
             output_path = str(self.organize_saved_obs_media(Path(output_path)))
             self.log(f"OBS recording saved: {output_path}")
-        self.cleanup_output_storage()
+        self.schedule_output_storage_cleanup()
         self.log("Stopped recording.")
 
     def _stop_obs_runtime_locked(self):
@@ -3944,6 +3985,29 @@ PeakMeterType=0
                 creationflags=CREATE_NO_WINDOW,
             )
             return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    def has_video_stream(self, media_path):
+        ffprobe = self.find_ffprobe()
+        if not ffprobe:
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=index",
+                    "-of", "csv=p=0",
+                    str(media_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=12,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return result.returncode == 0 and bool(result.stdout.strip())
         except Exception:
             return False
 
@@ -4088,7 +4152,9 @@ PeakMeterType=0
 
     def capture_backend(self, backend_override=None):
         requested = backend_override or self.config.get("capture_backend", "auto")
-        if backend_override is None and bool(self.config.get("capture_desktop_overlays", False)):
+        if backend_override is None and bool(
+            self.config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])
+        ):
             requested = "obs"
         mode = self.config.get("capture_mode", "desktop_all")
         if requested == "ddagrab":
@@ -4721,6 +4787,152 @@ PeakMeterType=0
             args += ["-movflags", "+faststart"]
         return args
 
+    def build_media_trim_command(
+        self,
+        input_path,
+        output_path,
+        start_seconds,
+        end_seconds,
+        accurate=False,
+        include_audio=True,
+        progress=False,
+    ):
+        ffmpeg = self.require_ffmpeg()
+        start = max(0.0, float(start_seconds or 0))
+        duration = max(0.01, float(end_seconds or 0) - start)
+        command = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y"]
+        if accurate and start > 0:
+            command += ["-ss", f"{start:.3f}"]
+        command += ["-i", str(input_path)]
+        if not accurate and start > 0:
+            command += ["-ss", f"{start:.3f}"]
+        command += [
+            "-t", f"{duration:.3f}",
+            "-map", "0:v:0",
+        ]
+        if include_audio:
+            command += ["-map", "0:a?"]
+        command += ["-map_metadata", "0"]
+        if accurate:
+            command += self.encoder_args(
+                segmenting=False,
+                live_capture=False,
+                include_audio=False,
+                separate_audio=False,
+            )
+            if include_audio:
+                command += ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            command += ["-c", "copy"]
+        command += self.final_video_output_args(output_path)
+        if progress:
+            command += ["-progress", "pipe:1", "-nostats"]
+        command += [str(output_path)]
+        return command
+
+    def trim_media(
+        self,
+        input_path,
+        start_seconds,
+        end_seconds,
+        output_path=None,
+        accurate=False,
+        progress_callback=None,
+        cancel_event=None,
+    ):
+        input_path = Path(input_path)
+        if not input_path.exists():
+            raise FileNotFoundError(input_path)
+        duration = self.probe_duration(input_path)
+        if not duration or duration <= 0:
+            raise RuntimeError("Could not read the clip duration.")
+        start, end = clamp_trim_range(start_seconds, end_seconds, duration)
+        output_path = Path(output_path) if output_path else trimmed_copy_path(input_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_name(
+            f".{output_path.stem}.shadowclip-edit-{uuid.uuid4().hex}{output_path.suffix}"
+        )
+        log_path = self.logs_dir / timestamp_name("clip_edit", "log")
+        selection_duration = end - start
+
+        def run_export(use_accurate):
+            command = self.build_media_trim_command(
+                input_path,
+                temp_path,
+                start,
+                end,
+                accurate=use_accurate,
+                include_audio=True,
+                progress=True,
+            )
+            with log_path.open("a", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=log_handle,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                if process.stdout:
+                    for raw_line in process.stdout:
+                        if cancel_event and cancel_event.is_set():
+                            process.terminate()
+                            break
+                        key, separator, value = raw_line.strip().partition("=")
+                        if not separator or not progress_callback:
+                            continue
+                        if key in {"out_time_us", "out_time_ms"}:
+                            try:
+                                progress_callback(
+                                    min(
+                                        0.99,
+                                        max(
+                                            0.0,
+                                            float(value) / 1_000_000.0 / selection_duration,
+                                        ),
+                                    )
+                                )
+                            except (TypeError, ValueError):
+                                pass
+                    process.stdout.close()
+                return_code = process.wait()
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("Export cancelled.")
+            return return_code
+
+        try:
+            return_code = run_export(bool(accurate))
+            if return_code == 0 and not self.has_video_stream(temp_path):
+                return_code = 1
+            if return_code != 0 and not accurate:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                self.log(
+                    "Fast clip edit was not supported by this file; "
+                    "retrying frame-accurate export."
+                )
+                return_code = run_export(True)
+            if return_code != 0 or not temp_path.exists():
+                raise RuntimeError(f"Clip export failed. See log: {log_path}")
+            replace_with_retries(temp_path, output_path)
+            if self.last_clip_path and Path(self.last_clip_path) == input_path:
+                self.last_clip_path = output_path
+            if progress_callback:
+                progress_callback(1.0)
+            self.log(f"Trimmed clip saved: {output_path}")
+            self.schedule_output_storage_cleanup()
+            return output_path
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
     def output_dir(self):
         path = expand_path(self.config.get("output_dir", DEFAULT_CONFIG["output_dir"]))
         path.mkdir(parents=True, exist_ok=True)
@@ -4874,6 +5086,35 @@ PeakMeterType=0
                 pass
         if deleted:
             self.log(f"Storage cleanup removed {deleted} old file(s), freed {freed / (1024 ** 3):.2f} GB.")
+
+    def schedule_output_storage_cleanup(self, force=False):
+        try:
+            max_storage_gb = float(self.config.get("max_storage_gb", 0) or 0)
+        except (TypeError, ValueError):
+            max_storage_gb = 0
+        if max_storage_gb <= 0:
+            return
+        now = time.time()
+        with self.storage_cleanup_lock:
+            if self.storage_cleanup_running:
+                return
+            if not force and now - self.last_storage_cleanup_at < 30:
+                return
+            self.storage_cleanup_running = True
+
+        def worker():
+            try:
+                self.cleanup_output_storage()
+            finally:
+                with self.storage_cleanup_lock:
+                    self.last_storage_cleanup_at = time.time()
+                    self.storage_cleanup_running = False
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="ShadowClipStorageCleanup",
+        ).start()
 
     def flush_log_handle(self, handle):
         try:
@@ -5150,7 +5391,7 @@ PeakMeterType=0
         self.recording_audio_owned = False
         self.close_record_log()
         self.cleanup_segments()
-        self.cleanup_output_storage()
+        self.schedule_output_storage_cleanup()
 
     def start_replay(self, preserve_buffer=False, from_watchdog=False):
         if self.replay_proc and self.replay_proc.poll() is None:
@@ -5507,26 +5748,15 @@ PeakMeterType=0
                     seek_start = max((duration or 0) - trim_duration, 0)
                     separate_audio = self.has_separate_audio_capture()
                     include_live_audio = bool(self.direct_audio_input_devices(separate_audio=separate_audio))
-                    audio_map_args = ["-map", "0:a?"] if include_live_audio else []
-                    trim_cmd = [
-                        ffmpeg,
-                        "-hide_banner",
-                        "-loglevel", "warning",
-                        "-y",
-                        "-fflags", "+genpts",
-                        "-i", str(joined),
-                    ]
-                    if seek_start > 0:
-                        trim_cmd += ["-ss", f"{seek_start:.3f}"]
-                    trim_cmd += [
-                        "-t", str(trim_duration),
-                        "-map", "0:v:0",
-                    ] + audio_map_args + self.encoder_args(
-                        segmenting=False,
-                        live_capture=False,
+                    use_fast_trim = seek_start <= 0.01
+                    trim_cmd = self.build_media_trim_command(
+                        joined,
+                        output,
+                        seek_start,
+                        seek_start + trim_duration,
+                        accurate=not use_fast_trim,
                         include_audio=include_live_audio,
-                        separate_audio=separate_audio,
-                    ) + self.final_video_output_args(output) + [str(output)]
+                    )
                     result = subprocess.run(
                         trim_cmd,
                         stdout=subprocess.DEVNULL,
@@ -5534,32 +5764,57 @@ PeakMeterType=0
                         creationflags=CREATE_NO_WINDOW,
                     )
                     if (
+                        use_fast_trim
+                        and result.returncode == 0
+                        and not self.has_video_stream(output)
+                    ):
+                        try:
+                            output.unlink()
+                        except OSError:
+                            pass
+                        result = subprocess.CompletedProcess(trim_cmd, 1)
+                    if result.returncode != 0 and use_fast_trim:
+                        self.log(
+                            "Fast clip save was not supported by this segment; "
+                            "retrying with frame-accurate encoding."
+                        )
+                        try:
+                            output.unlink()
+                        except OSError:
+                            pass
+                        trim_cmd = self.build_media_trim_command(
+                            joined,
+                            output,
+                            seek_start,
+                            seek_start + trim_duration,
+                            accurate=True,
+                            include_audio=include_live_audio,
+                        )
+                        result = subprocess.run(
+                            trim_cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=log_handle,
+                            creationflags=CREATE_NO_WINDOW,
+                        )
+                    if (
                         result.returncode != 0
                         and self.config.get("video_encoder") == "auto"
                         and self.encoder_cache in HARDWARE_VIDEO_ENCODERS
                     ):
                         failed_encoder = self.encoder_cache
                         self.encoder_cache = "libx264"
-                        self.log(f"{video_encoder_label(failed_encoder)} failed during clip trim; retrying with libx264.")
-                        trim_cmd = [
-                            ffmpeg,
-                            "-hide_banner",
-                            "-loglevel", "warning",
-                            "-y",
-                            "-fflags", "+genpts",
-                            "-i", str(joined),
-                        ]
-                        if seek_start > 0:
-                            trim_cmd += ["-ss", f"{seek_start:.3f}"]
-                        trim_cmd += [
-                            "-t", str(trim_duration),
-                            "-map", "0:v:0",
-                        ] + audio_map_args + self.encoder_args(
-                            segmenting=False,
-                            live_capture=False,
+                        self.log(
+                            f"{video_encoder_label(failed_encoder)} failed during clip trim; "
+                            "retrying with libx264."
+                        )
+                        trim_cmd = self.build_media_trim_command(
+                            joined,
+                            output,
+                            seek_start,
+                            seek_start + trim_duration,
+                            accurate=True,
                             include_audio=include_live_audio,
-                            separate_audio=separate_audio,
-                        ) + self.final_video_output_args(output) + [str(output)]
+                        )
                         result = subprocess.run(
                             trim_cmd,
                             stdout=subprocess.DEVNULL,
@@ -5599,7 +5854,7 @@ PeakMeterType=0
             if result.returncode == 0:
                 self.last_clip_path = output
                 self.log(f"Clip saved ({clip_label}): {output}")
-                self.cleanup_output_storage()
+                self.schedule_output_storage_cleanup()
                 if reset_after_clip:
                     self.last_clip_saved_at = now
                     self.cleanup_segments()
@@ -5756,8 +6011,7 @@ class ShadowClipApp:
         self.event_toast = None
         self.event_toast_after_ids = []
         self.recording_indicator = None
-        self.recording_indicator_title = None
-        self.recording_indicator_detail = None
+        self.recording_indicator_state = None
         self.noactivate_window_procs = {}
         self.fullscreen_capture_signature = None
         self.fullscreen_capture_pending_signature = None
@@ -6011,7 +6265,7 @@ class ShadowClipApp:
         hud.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         for col in range(4):
             hud.columnconfigure(col, weight=1 if col in (1, 3) else 0)
-        ttk.Checkbutton(hud, text=ui_text("record", "REC indicator"), variable=self.vars["recording_indicator_enabled"]).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(hud, text=ui_text("record", "Capture status icons"), variable=self.vars["recording_indicator_enabled"]).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         ttk.Checkbutton(hud, text=ui_text("audio", "Event sounds"), variable=self.vars["event_sounds_enabled"]).grid(row=0, column=2, columnspan=2, sticky="w", padx=8, pady=4)
         ttk.Checkbutton(hud, text=ui_text("clip", "Close HUD after clip"), variable=self.vars["hide_overlay_after_clip"]).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         ttk.Checkbutton(hud, text=ui_text("settings", "Fullscreen-safe HUD"), variable=self.vars["fullscreen_safe_hud"]).grid(row=1, column=2, columnspan=2, sticky="w", padx=8, pady=4)
@@ -6099,6 +6353,14 @@ class ShadowClipApp:
         )
         style.configure("Accent.TButton", background=colors["accent"], foreground="#081008", borderwidth=0, focusthickness=0, padding=(12, 8))
         style.map("Accent.TButton", background=[("active", colors["accent_hover"]), ("pressed", colors["accent_dark"])])
+        style.configure(
+            "Accent.Horizontal.TProgressbar",
+            troughcolor=colors["panel_3"],
+            background=colors["accent"],
+            darkcolor=colors["accent"],
+            lightcolor=colors["accent"],
+            bordercolor=colors["border"],
+        )
         style.configure("Card.TCheckbutton", background=colors["panel"], foreground=colors["text"], focuscolor=colors["panel"])
         style.map(
             "Card.TCheckbutton",
@@ -7197,10 +7459,12 @@ class ShadowClipApp:
         buttons.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 18))
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
-        buttons.columnconfigure(2, weight=0)
+        buttons.columnconfigure(2, weight=1)
+        buttons.columnconfigure(3, weight=0)
         self.small_action_button(buttons, "Open", self.open_last_clip, icon_key="open").grid(row=0, column=0, sticky="ew", padx=(0, 7))
-        self.small_action_button(buttons, "Show in Folder", self.show_last_clip, icon_key="folder").grid(row=0, column=1, sticky="ew", padx=7)
-        self.small_action_button(buttons, self.dashboard_icon("more"), self.open_output).grid(row=0, column=2, sticky="ew", padx=(7, 0))
+        self.small_action_button(buttons, "Edit", self.edit_last_clip, icon_key="video").grid(row=0, column=1, sticky="ew", padx=7)
+        self.small_action_button(buttons, "Show", self.show_last_clip, icon_key="folder").grid(row=0, column=2, sticky="ew", padx=7)
+        self.small_action_button(buttons, self.dashboard_icon("more"), self.open_output).grid(row=0, column=3, sticky="ew", padx=(7, 0))
 
         storage = self.dashboard_panel(details)
         storage.grid(row=0, column=1, sticky="nsew", padx=9)
@@ -7395,7 +7659,7 @@ class ShadowClipApp:
         else:
             self.draw_last_clip_placeholder("Preview unavailable")
 
-    def create_video_thumbnail(self, clip, thumbnail_path, width, height):
+    def create_video_thumbnail(self, clip, thumbnail_path, width, height, seek_seconds=None):
         ffmpeg = self.manager.find_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("FFmpeg not found")
@@ -7407,7 +7671,11 @@ class ShadowClipApp:
         )
         last_error = ""
         try:
-            for seek_args in (["-ss", "1"], ["-ss", "0.1"]):
+            if seek_seconds is None:
+                seek_options = (1.0, 0.1)
+            else:
+                seek_options = (max(0.0, float(seek_seconds)),)
+            for seek_seconds_value in seek_options:
                 if temp_path.exists():
                     temp_path.unlink()
                 command = [
@@ -7416,7 +7684,8 @@ class ShadowClipApp:
                     "-loglevel",
                     "error",
                     "-y",
-                    *seek_args,
+                    "-ss",
+                    f"{seek_seconds_value:.3f}",
                     "-i",
                     str(clip),
                     "-frames:v",
@@ -7890,10 +8159,12 @@ class ShadowClipApp:
         actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 15))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
+        actions.columnconfigure(2, weight=1)
         self.small_action_button(actions, "Open", lambda path=item["path"]: self.play_clip_path(path), icon_key="open").grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.small_action_button(actions, "Show", lambda path=item["path"]: self.reveal_clip_path(path), icon_key="folder").grid(row=0, column=1, sticky="ew", padx=5)
+        self.small_action_button(actions, "Edit", lambda path=item["path"]: self.open_clip_editor(path), icon_key="video").grid(row=0, column=1, sticky="ew", padx=5)
+        self.small_action_button(actions, "Show", lambda path=item["path"]: self.reveal_clip_path(path), icon_key="folder").grid(row=0, column=2, sticky="ew", padx=5)
         more = self.small_action_button(actions, "...", lambda path=item["path"]: self.show_clip_library_button_menu(path, more))
-        more.grid(row=0, column=2, sticky="ew", padx=(5, 0))
+        more.grid(row=0, column=3, sticky="ew", padx=(5, 0))
         card.bind("<Button-3>", lambda event, path=item["path"]: self.show_clip_library_menu(event, path), add="+")
         self.bind_clip_gallery_mousewheel(card)
         self.queue_clip_gallery_media(item, preview, metadata)
@@ -8075,6 +8346,7 @@ class ShadowClipApp:
         colors = self.ui_colors
         menu = tk.Menu(self.root, tearoff=False, bg=colors["panel_2"], fg=colors["text"], activebackground=colors["accent"], activeforeground="#071007", relief="flat", bd=1)
         menu.add_command(label="Open", command=lambda: self.play_clip_path(path))
+        menu.add_command(label="Edit clip", command=lambda: self.open_clip_editor(path))
         menu.add_command(label="Show in folder", command=lambda: self.reveal_clip_path(path))
         menu.add_separator()
         menu.add_command(label="Rename", command=lambda: self.rename_clip_library_path(path))
@@ -8083,6 +8355,644 @@ class ShadowClipApp:
             menu.tk_popup(int(x), int(y))
         finally:
             menu.grab_release()
+
+    def edit_last_clip(self):
+        clip = self.manager.latest_clip_path()
+        if not clip:
+            self.threadsafe_log("No saved clip found yet.")
+            return
+        self.open_clip_editor(clip)
+
+    def open_clip_editor(self, path):
+        path = Path(path)
+        if not path.exists():
+            self.threadsafe_log(f"Media file no longer exists: {path}")
+            self.refresh_clip_library(force=True)
+            return
+        if not self.manager.find_ffmpeg() or not self.manager.find_ffprobe():
+            messagebox.showerror(
+                APP_NAME,
+                "The clip editor needs the bundled FFmpeg tools.\n\n"
+                "Run Check Setup and repair FFmpeg first.",
+                parent=self.root,
+            )
+            return
+
+        colors = self.ui_colors
+        window = tk.Toplevel(self.root)
+        window.title(f"Edit clip - {path.name}")
+        window.configure(bg=colors["bg"])
+        window.geometry("980x720")
+        window.minsize(820, 680)
+        window.transient(self.root)
+        state = {
+            "window": window,
+            "path": path,
+            "duration": 0.0,
+            "preview_images": {},
+            "preview_after": {},
+            "preview_requests": {"start": 0, "end": 0},
+            "updating": False,
+            "exporting": False,
+            "cancel_event": threading.Event(),
+        }
+        window._shadowclip_editor_state = state
+        loading = tk.Frame(window, bg=colors["bg"])
+        loading.pack(fill="both", expand=True)
+        self.create_icon_canvas(
+            loading,
+            "video",
+            size=48,
+            fg=colors["accent"],
+            bg=colors["bg"],
+        ).pack(pady=(180, 18))
+        tk.Label(
+            loading,
+            text="Preparing clip editor...",
+            bg=colors["bg"],
+            fg=colors["text"],
+            font=("Segoe UI", 16, "bold"),
+        ).pack()
+        tk.Label(
+            loading,
+            text=path.name,
+            bg=colors["bg"],
+            fg=colors["muted"],
+            font=("Segoe UI", 10),
+        ).pack(pady=(8, 0))
+        state["loading"] = loading
+        window.protocol("WM_DELETE_WINDOW", lambda: self.close_clip_editor(state))
+
+        def probe_worker():
+            duration = self.manager.probe_duration(path)
+            error = None if duration and duration > 0 else "Could not read the clip duration."
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.finish_clip_editor_loading(state, duration or 0.0, error),
+                )
+            except (tk.TclError, RuntimeError):
+                pass
+
+        threading.Thread(
+            target=probe_worker,
+            daemon=True,
+            name="ShadowClipEditorProbe",
+        ).start()
+
+    def finish_clip_editor_loading(self, state, duration, error=None):
+        window = state["window"]
+        if not window.winfo_exists():
+            return
+        if error:
+            messagebox.showerror(APP_NAME, error, parent=window)
+            window.destroy()
+            return
+        state["duration"] = float(duration)
+        state["loading"].destroy()
+        self.build_clip_editor(state)
+
+    def build_clip_editor(self, state):
+        colors = self.ui_colors
+        window = state["window"]
+        duration = state["duration"]
+        root = tk.Frame(window, bg=colors["bg"])
+        root.pack(fill="both", expand=True, padx=24, pady=14)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+
+        header = tk.Frame(root, bg=colors["bg"])
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        header.columnconfigure(0, weight=1)
+        tk.Label(
+            header,
+            text="Clip editor",
+            bg=colors["bg"],
+            fg=colors["text"],
+            font=("Segoe UI", 19, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            header,
+            text=state["path"].name,
+            bg=colors["bg"],
+            fg=colors["muted"],
+            font=("Segoe UI", 10),
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        tk.Label(
+            header,
+            text=f"Source duration  {format_precise_duration(duration)}",
+            bg=colors["bg"],
+            fg=colors["muted"],
+            font=("Segoe UI", 10),
+        ).grid(row=0, column=1, rowspan=2, sticky="e")
+
+        preview_row = tk.Frame(root, bg=colors["bg"])
+        preview_row.grid(row=1, column=0, sticky="nsew", pady=(0, 16))
+        preview_row.columnconfigure(0, weight=1, uniform="editor_preview")
+        preview_row.columnconfigure(1, weight=1, uniform="editor_preview")
+        for column, kind, title in ((0, "start", "Start frame"), (1, "end", "End frame")):
+            panel = self.dashboard_panel(preview_row)
+            panel.grid(
+                row=0,
+                column=column,
+                sticky="nsew",
+                padx=(0, 8) if column == 0 else (8, 0),
+            )
+            panel.columnconfigure(0, weight=1)
+            tk.Label(
+                panel,
+                text=title,
+                bg=colors["panel"],
+                fg=colors["text"],
+                font=("Segoe UI", 11, "bold"),
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 10))
+            canvas = tk.Canvas(
+                panel,
+                bg="#090d13",
+                height=180,
+                highlightthickness=1,
+                highlightbackground=colors["border_soft"],
+                bd=0,
+            )
+            canvas.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+            canvas.bind(
+                "<Configure>",
+                lambda _event, editor_state=state, preview_kind=kind: self.redraw_clip_editor_preview(
+                    editor_state,
+                    preview_kind,
+                ),
+                add="+",
+            )
+            state[f"{kind}_canvas"] = canvas
+
+        controls = self.dashboard_panel(root)
+        controls.grid(row=2, column=0, sticky="nsew")
+        controls.columnconfigure(0, weight=1)
+        start_var = tk.DoubleVar(value=0.0)
+        end_var = tk.DoubleVar(value=duration)
+        state["start_var"] = start_var
+        state["end_var"] = end_var
+        state["mode_var"] = tk.StringVar(value="fast")
+        state["replace_var"] = tk.BooleanVar(value=False)
+        state["start_label_var"] = tk.StringVar()
+        state["end_label_var"] = tk.StringVar()
+        state["selection_label_var"] = tk.StringVar()
+        state["status_var"] = tk.StringVar(value="Ready to trim")
+        state["progress_var"] = tk.DoubleVar(value=0.0)
+
+        self.build_clip_editor_range_row(controls, state, "start", 0)
+        self.build_clip_editor_range_row(controls, state, "end", 1)
+
+        summary = tk.Frame(controls, bg=colors["panel"])
+        summary.grid(row=2, column=0, sticky="ew", padx=18, pady=(4, 14))
+        summary.columnconfigure(0, weight=1)
+        tk.Label(
+            summary,
+            textvariable=state["selection_label_var"],
+            bg=colors["panel"],
+            fg=colors["accent"],
+            font=("Segoe UI", 11, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        options = tk.Frame(controls, bg=colors["panel"])
+        options.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
+        options.columnconfigure(3, weight=1)
+        tk.Label(
+            options,
+            text="Export mode",
+            bg=colors["panel"],
+            fg=colors["muted"],
+            font=("Segoe UI", 9),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            options,
+            text="Fast and lossless",
+            variable=state["mode_var"],
+            value="fast",
+            style="Card.TRadiobutton",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Radiobutton(
+            options,
+            text="Frame accurate",
+            variable=state["mode_var"],
+            value="accurate",
+            style="Card.TRadiobutton",
+        ).grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(
+            options,
+            text="Replace original",
+            variable=state["replace_var"],
+            style="Card.TCheckbutton",
+        ).grid(row=0, column=4, sticky="e")
+        tk.Label(
+            options,
+            text="Fast mode keeps the original video quality and cuts at the nearest keyframe.",
+            bg=colors["panel"],
+            fg=colors["muted_dark"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+
+        progress = ttk.Progressbar(
+            controls,
+            variable=state["progress_var"],
+            maximum=100,
+            mode="determinate",
+            style="Accent.Horizontal.TProgressbar",
+        )
+        progress.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 8))
+        state["progress"] = progress
+        tk.Label(
+            controls,
+            textvariable=state["status_var"],
+            bg=colors["panel"],
+            fg=colors["muted"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 12))
+
+        buttons = tk.Frame(controls, bg=colors["panel"])
+        buttons.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 18))
+        buttons.columnconfigure(0, weight=1)
+        save_button = self.small_action_button(
+            buttons,
+            "Save trimmed copy",
+            lambda: self.start_clip_editor_export(state),
+            accent=True,
+            icon_key="clapper",
+        )
+        save_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        cancel_button = self.small_action_button(
+            buttons,
+            "Close",
+            lambda: self.close_clip_editor(state),
+        )
+        cancel_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        state["save_button"] = save_button
+        state["cancel_button"] = cancel_button
+
+        state["replace_var"].trace_add(
+            "write",
+            lambda *_args: state["save_button"].configure(
+                text="Replace original"
+                if state["replace_var"].get()
+                else "Save trimmed copy"
+            ),
+        )
+        self.update_clip_editor_selection(state, "start", 0.0)
+        self.update_clip_editor_selection(state, "end", duration)
+
+    def build_clip_editor_range_row(self, parent, state, kind, row):
+        colors = self.ui_colors
+        frame = tk.Frame(parent, bg=colors["panel"])
+        frame.grid(row=row, column=0, sticky="ew", padx=18, pady=(14, 0))
+        frame.columnconfigure(1, weight=1)
+        label_text = "Start" if kind == "start" else "End"
+        tk.Label(
+            frame,
+            text=label_text,
+            bg=colors["panel"],
+            fg=colors["text"],
+            font=("Segoe UI", 10, "bold"),
+            width=7,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        scale = tk.Scale(
+            frame,
+            from_=0,
+            to=state["duration"],
+            resolution=0.05,
+            showvalue=False,
+            orient="horizontal",
+            variable=state[f"{kind}_var"],
+            command=lambda value, editor_state=state, range_kind=kind: self.update_clip_editor_selection(
+                editor_state,
+                range_kind,
+                value,
+            ),
+            bg=colors["panel"],
+            fg=colors["text"],
+            troughcolor=colors["panel_3"],
+            activebackground=colors["accent_hover"],
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            sliderlength=18,
+            width=10,
+        )
+        scale.grid(row=0, column=1, sticky="ew", padx=(8, 10))
+        state[f"{kind}_scale"] = scale
+        tk.Label(
+            frame,
+            textvariable=state[f"{kind}_label_var"],
+            bg=colors["panel"],
+            fg=colors["accent"],
+            font=("Consolas", 10, "bold"),
+            width=12,
+            anchor="e",
+        ).grid(row=0, column=2, sticky="e", padx=(0, 8))
+        self.small_action_button(
+            frame,
+            "-1s",
+            lambda editor_state=state, range_kind=kind: self.step_clip_editor_range(
+                editor_state,
+                range_kind,
+                -1.0,
+            ),
+        ).grid(row=0, column=3, padx=3)
+        self.small_action_button(
+            frame,
+            "+1s",
+            lambda editor_state=state, range_kind=kind: self.step_clip_editor_range(
+                editor_state,
+                range_kind,
+                1.0,
+            ),
+        ).grid(row=0, column=4, padx=(3, 0))
+
+    def step_clip_editor_range(self, state, kind, delta):
+        variable = state[f"{kind}_var"]
+        self.update_clip_editor_selection(state, kind, variable.get() + float(delta))
+
+    def update_clip_editor_selection(self, state, changed_kind, value):
+        if state.get("updating") or not state["window"].winfo_exists():
+            return
+        state["updating"] = True
+        try:
+            start = state["start_var"].get()
+            end = state["end_var"].get()
+            try:
+                changed_value = float(value)
+            except (TypeError, ValueError):
+                changed_value = start if changed_kind == "start" else end
+            if changed_kind == "start":
+                start = changed_value
+            else:
+                end = changed_value
+            start, end = clamp_trim_range(start, end, state["duration"])
+            state["start_var"].set(start)
+            state["end_var"].set(end)
+            state["start_label_var"].set(format_precise_duration(start))
+            state["end_label_var"].set(format_precise_duration(end))
+            state["selection_label_var"].set(
+                f"Selected  {format_precise_duration(end - start)}"
+            )
+        finally:
+            state["updating"] = False
+        self.schedule_clip_editor_preview(state, changed_kind)
+
+    def schedule_clip_editor_preview(self, state, kind):
+        window = state["window"]
+        previous = state["preview_after"].get(kind)
+        if previous:
+            try:
+                window.after_cancel(previous)
+            except tk.TclError:
+                pass
+        state["preview_after"][kind] = window.after(
+            180,
+            lambda: self.start_clip_editor_preview(state, kind),
+        )
+
+    def start_clip_editor_preview(self, state, kind):
+        window = state["window"]
+        if not window.winfo_exists():
+            return
+        state["preview_after"][kind] = None
+        timestamp = state[f"{kind}_var"].get()
+        if kind == "end":
+            timestamp = max(0.0, min(timestamp - 0.05, state["duration"] - 0.05))
+        state["preview_requests"][kind] += 1
+        request_id = state["preview_requests"][kind]
+        signature = self.thumbnail_signature_for_clip(state["path"], 420, 236)
+        digest_value = "|".join(
+            str(part) for part in (*signature, kind, round(timestamp, 2))
+        )
+        digest = hashlib.sha1(digest_value.encode("utf-8", errors="ignore")).hexdigest()
+        thumbnail_path = self.last_clip_thumbnail_dir() / f"edit_{digest}.png"
+        canvas = state[f"{kind}_canvas"]
+        canvas.delete("all")
+        canvas.create_text(
+            max(1, canvas.winfo_width()) // 2,
+            max(1, canvas.winfo_height()) // 2,
+            text="Generating preview...",
+            fill=self.ui_colors["muted"],
+            font=("Segoe UI", 10),
+        )
+
+        def worker():
+            error = None
+            try:
+                if not thumbnail_path.exists():
+                    self.create_video_thumbnail(
+                        state["path"],
+                        thumbnail_path,
+                        420,
+                        236,
+                        seek_seconds=timestamp,
+                    )
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.finish_clip_editor_preview(
+                        state,
+                        kind,
+                        request_id,
+                        thumbnail_path,
+                        timestamp,
+                        error,
+                    ),
+                )
+            except (tk.TclError, RuntimeError):
+                pass
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"ShadowClipEditorPreview-{kind}",
+        ).start()
+
+    def finish_clip_editor_preview(
+        self,
+        state,
+        kind,
+        request_id,
+        thumbnail_path,
+        timestamp,
+        error=None,
+    ):
+        window = state["window"]
+        if not window.winfo_exists() or state["preview_requests"][kind] != request_id:
+            return
+        if error or not Path(thumbnail_path).exists():
+            canvas = state[f"{kind}_canvas"]
+            canvas.delete("all")
+            canvas.create_text(
+                max(1, canvas.winfo_width()) // 2,
+                max(1, canvas.winfo_height()) // 2,
+                text="Preview unavailable",
+                fill=self.ui_colors["muted"],
+                font=("Segoe UI", 10),
+            )
+            return
+        try:
+            state["preview_images"][kind] = tk.PhotoImage(file=str(thumbnail_path))
+            state[f"{kind}_preview_time"] = timestamp
+            self.redraw_clip_editor_preview(state, kind)
+        except tk.TclError:
+            pass
+
+    def redraw_clip_editor_preview(self, state, kind):
+        canvas = state.get(f"{kind}_canvas")
+        image = state["preview_images"].get(kind)
+        if not canvas or image is None:
+            return
+        try:
+            width = max(1, canvas.winfo_width())
+            height = max(1, canvas.winfo_height())
+            canvas.delete("all")
+            canvas.create_image(width // 2, height // 2, image=image)
+            canvas.create_rectangle(
+                0,
+                height - 34,
+                width,
+                height,
+                fill="#090d13",
+                outline="",
+                stipple="gray50",
+            )
+            canvas.create_text(
+                12,
+                height - 17,
+                text=format_precise_duration(
+                    state.get(f"{kind}_preview_time", 0.0)
+                ),
+                fill=self.ui_colors["text"],
+                font=("Consolas", 10, "bold"),
+                anchor="w",
+            )
+        except tk.TclError:
+            pass
+
+    def start_clip_editor_export(self, state):
+        if state.get("exporting"):
+            return
+        path = state["path"]
+        start, end = clamp_trim_range(
+            state["start_var"].get(),
+            state["end_var"].get(),
+            state["duration"],
+        )
+        replace_original = bool(state["replace_var"].get())
+        if replace_original and not messagebox.askyesno(
+            APP_NAME,
+            "Replace the original clip with the trimmed version?\n\n"
+            "This cannot be undone.",
+            parent=state["window"],
+        ):
+            return
+        output_path = path if replace_original else trimmed_copy_path(path)
+        state["exporting"] = True
+        state["cancel_event"].clear()
+        state["progress_var"].set(0.0)
+        state["status_var"].set(
+            "Exporting frame-accurate clip..."
+            if state["mode_var"].get() == "accurate"
+            else "Saving without re-encoding..."
+        )
+        state["save_button"].configure(state="disabled")
+        state["cancel_button"].configure(text="Cancel export")
+
+        def progress_callback(value):
+            try:
+                self.root.after(
+                    0,
+                    lambda amount=value: self.update_clip_editor_progress(
+                        state,
+                        amount,
+                    ),
+                )
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def worker():
+            result_path = None
+            error = None
+            try:
+                result_path = self.manager.trim_media(
+                    path,
+                    start,
+                    end,
+                    output_path=output_path,
+                    accurate=state["mode_var"].get() == "accurate",
+                    progress_callback=progress_callback,
+                    cancel_event=state["cancel_event"],
+                )
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self.root.after(
+                    0,
+                    lambda: self.finish_clip_editor_export(
+                        state,
+                        result_path,
+                        error,
+                    ),
+                )
+            except (tk.TclError, RuntimeError):
+                pass
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="ShadowClipEditorExport",
+        ).start()
+
+    def update_clip_editor_progress(self, state, value):
+        if not state["window"].winfo_exists():
+            return
+        state["progress_var"].set(max(0.0, min(100.0, float(value) * 100.0)))
+
+    def finish_clip_editor_export(self, state, result_path, error=None):
+        window = state["window"]
+        if not window.winfo_exists():
+            return
+        state["exporting"] = False
+        state["save_button"].configure(state="normal")
+        state["cancel_button"].configure(text="Close")
+        if error:
+            if "cancelled" in error.casefold():
+                state["status_var"].set("Export cancelled")
+            else:
+                state["status_var"].set("Export failed")
+                messagebox.showerror(APP_NAME, error, parent=window)
+            return
+        state["progress_var"].set(100.0)
+        state["status_var"].set(f"Saved  {Path(result_path).name}")
+        self.refresh_clip_library(force=True)
+        self.refresh_status_panel()
+        messagebox.showinfo(
+            APP_NAME,
+            f"Trimmed clip saved.\n\n{result_path}",
+            parent=window,
+        )
+
+    def close_clip_editor(self, state):
+        window = state["window"]
+        if state.get("exporting"):
+            state["cancel_event"].set()
+            state["status_var"].set("Cancelling export...")
+            return
+        try:
+            window.destroy()
+        except tk.TclError:
+            pass
 
     def rename_clip_library_path(self, path):
         path = Path(path)
@@ -8304,7 +9214,7 @@ class ShadowClipApp:
         behavior_body.columnconfigure(0, weight=1)
         self.settings_toggle(behavior_body, "Fullscreen-safe HUD", "Use the non-activating overlay mode for fullscreen applications.", self.vars["fullscreen_safe_hud"], 0)
         self.settings_toggle(behavior_body, "Close HUD after saving", "Return to the game automatically after Save Clip.", self.vars["hide_overlay_after_clip"], 1)
-        self.settings_toggle(behavior_body, "Recording indicator", "Show the compact REC indicator while a normal recording runs.", self.vars["recording_indicator_enabled"], 2)
+        self.settings_toggle(behavior_body, "Capture status icons", "Show compact Replay and REC icons while capture is active.", self.vars["recording_indicator_enabled"], 2)
         self.settings_field_label(behavior_body, "HUD gallery size", "Number of recent clips shown inside the Alt+Z gallery.", 3)
         ttk.Spinbox(behavior_body, from_=3, to=50, increment=1, textvariable=self.vars["gallery_limit"], width=12, style="Modern.TSpinbox").grid(row=4, column=0, sticky="w", pady=(2, 0))
 
@@ -8318,6 +9228,7 @@ class ShadowClipApp:
         self.settings_field_label(feedback_body, "Toast position", "Screen corner used for event notifications.", 2, 0)
         ttk.Combobox(feedback_body, state="readonly", textvariable=self.vars["toast_position"], values=["top_right", "bottom_right", "top_left", "bottom_left"], width=16, style="Modern.TCombobox").grid(row=2, column=1, sticky="e", padx=(18, 0), pady=5)
         self.small_action_button(feedback_body, "Show test notification", lambda: self.show_event_toast("ShadowClip", "Notifications are ready.", "clip"), icon_key="check").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        self.small_action_button(feedback_body, "Preview Pulse Deep sounds", self.preview_event_sound_set, icon_key="audio_bars").grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     def build_hotkeys_page(self, parent):
         colors = self.ui_colors
@@ -9906,7 +10817,10 @@ class ShadowClipApp:
             elif key in {"max_storage_gb"}:
                 value = float(value)
             config[key] = value
-        config["capture_desktop_overlays"] = bool(config.get("capture_desktop_overlays", False))
+        config["capture_desktop_overlays"] = bool(
+            config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])
+        )
+        config["capture_desktop_overlays_migrated"] = True
         if config["capture_desktop_overlays"]:
             config["capture_backend"] = "obs"
             self.vars["capture_backend"].set("obs")
@@ -10234,8 +11148,8 @@ class ShadowClipApp:
         if max_storage_gb <= 0:
             self.threadsafe_log("Storage cleanup is disabled. Set Max storage GB above 0 first.")
             return
-        self.manager.cleanup_output_storage()
-        self.threadsafe_log(f"Storage cleanup checked limit: {max_storage_gb:g} GB.")
+        self.manager.schedule_output_storage_cleanup(force=True)
+        self.threadsafe_log(f"Storage cleanup started for limit: {max_storage_gb:g} GB.")
 
     def diagnostic_report_dir(self):
         path = self.manager.runtime_dir / "debug_reports"
@@ -12725,8 +13639,8 @@ class ShadowClipApp:
 
     def add_overlay_interface_section(self, parent):
         section = self.overlay_section(parent, ui_text("settings", "HUD and Feedback"))
-        self.overlay_label(section, ui_text("record", "REC indicator"), 1, 0)
-        self.overlay_check(section, "Show during recording", self.vars["recording_indicator_enabled"], 1, 1, 2)
+        self.overlay_label(section, ui_text("record", "Capture status icons"), 1, 0)
+        self.overlay_check(section, "Show while replay or recording is active", self.vars["recording_indicator_enabled"], 1, 1, 2)
         self.overlay_label(section, ui_text("audio", "Toast duration ms"), 2, 0)
         self.overlay_spinbox(section, self.vars["toast_duration_ms"], 2, 1, 500, 10000, 250)
         self.overlay_label(section, ui_text("tray", "Toast position"), 2, 2)
@@ -12777,21 +13691,26 @@ class ShadowClipApp:
         except tk.TclError:
             return True
 
-    def play_event_sound(self, icon_key="record"):
-        if not self.event_sounds_enabled() or winsound is None:
+    def play_event_sound(self, icon_key="record", force=False):
+        if (not force and not self.event_sounds_enabled()) or winsound is None:
             return
-        aliases = {
-            "clip": "SystemAsterisk",
-            "record": "SystemAsterisk",
-            "stop": "SystemExclamation",
-        }
+        sound_path = resource_path(EVENT_SOUND_FILES.get(icon_key, EVENT_SOUND_FILES["warning"]))
+        if not sound_path.exists():
+            return
         try:
             winsound.PlaySound(
-                aliases.get(icon_key, "SystemAsterisk"),
-                winsound.SND_ALIAS | winsound.SND_ASYNC,
+                str(sound_path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
             )
         except Exception:
             pass
+
+    def preview_event_sound_set(self):
+        for delay_ms, icon_key in ((0, "record"), (650, "clip"), (1300, "stop")):
+            self.root.after(
+                delay_ms,
+                lambda event_key=icon_key: self.play_event_sound(event_key, force=True),
+            )
 
     def show_event_toast(self, title, detail="", icon_key="record"):
         if self.root.winfo_exists():
@@ -12804,63 +13723,45 @@ class ShadowClipApp:
         toast.withdraw()
         self.event_toast = toast
         toast.overrideredirect(True)
-        toast.configure(bg="#050705")
+        transparent = "#010203"
+        toast.configure(bg=transparent)
         toast.attributes("-topmost", True)
         try:
             toast.attributes("-alpha", 0.96)
+            if os.name == "nt":
+                toast.attributes("-transparentcolor", transparent)
         except tk.TclError:
             pass
 
-        width = 360
-        height = 92
+        width = 68
+        height = 68
         bounds = self.current_overlay_bounds()
         screen_w = bounds["width"]
         screen_h = bounds["height"]
-        margin_x = 38
-        margin_top = 86
-        margin_bottom = 82
+        margin_x = 30
+        margin_top = 72
+        margin_bottom = 72
         position = self.toast_position()
         x = bounds["left"] + (margin_x if position.endswith("left") else max(0, screen_w - width - margin_x))
         y = bounds["top"] + (margin_top if position.startswith("top") else max(0, screen_h - height - margin_bottom))
         toast.geometry(f"{width}x{height}+{x}+{y}")
 
-        frame = tk.Frame(toast, bg="#070907", highlightbackground="#1c241c", highlightthickness=1)
-        frame.pack(fill="both", expand=True)
-        tk.Frame(frame, bg="#76b900", width=6).pack(side="left", fill="y")
+        frame = tk.Frame(
+            toast,
+            bg="#090d0b",
+            width=58,
+            height=58,
+            highlightbackground="#32402d",
+            highlightthickness=1,
+        )
+        frame.place(x=5, y=5, width=58, height=58)
+        visual_key, color = FEEDBACK_ICON_STYLES.get(icon_key, FEEDBACK_ICON_STYLES["warning"])
+        icon = tk.Canvas(frame, width=40, height=40, bg="#090d0b", highlightthickness=0, bd=0)
+        icon.place(relx=0.5, rely=0.5, anchor="center")
+        self.draw_dashboard_icon(icon, visual_key, 40, color)
+        toast._shadowclip_feedback = (title, detail, icon)
 
-        icon = ICONS.get(icon_key, ICONS.get("app", "*"))
-        tk.Label(
-            frame,
-            text=icon,
-            bg="#070907",
-            fg="#76b900",
-            font=("Segoe UI Symbol", 30, "bold"),
-            width=3,
-        ).pack(side="left", fill="y", padx=(16, 8))
-
-        text_frame = tk.Frame(frame, bg="#070907")
-        text_frame.pack(side="left", fill="both", expand=True, padx=(0, 18), pady=14)
-        tk.Label(
-            text_frame,
-            text=title,
-            bg="#070907",
-            fg="#f5f5f5",
-            anchor="w",
-            font=("Segoe UI", 11, "bold"),
-        ).pack(fill="x", anchor="w")
-        tk.Label(
-            text_frame,
-            text=detail,
-            bg="#070907",
-            fg="#c6c6c6",
-            anchor="w",
-            justify="left",
-            wraplength=245,
-            font=("Segoe UI", 8),
-        ).pack(fill="x", anchor="w", pady=(4, 0))
-
-        toast_click_through = self.use_fullscreen_safe_hud()
-        self.keep_game_overlay_visible(toast, click_through=toast_click_through, attempts=5, delay_ms=140)
+        self.keep_game_overlay_visible(toast, click_through=True, attempts=7, delay_ms=120)
         self.event_toast_after_ids.append(self.root.after(self.toast_duration_ms(), lambda: self.fade_event_toast(0.96)))
 
     def fade_event_toast(self, alpha):
@@ -13181,59 +14082,69 @@ class ShadowClipApp:
         self.root.after(1000, self.tick_recording_timer)
 
     def update_recording_indicator(self):
-        if not self.recording_running() or not self.recording_indicator_enabled():
+        replay_active = self.replay_running()
+        recording_active = self.recording_running()
+        state = (replay_active, recording_active)
+        if not any(state) or not self.recording_indicator_enabled():
             self.hide_recording_indicator()
             return
-        if not self.recording_indicator or not self.recording_indicator.winfo_exists():
-            self.build_recording_indicator()
-        detail = self.recording_detail_label() or "Recording"
+        if (
+            not self.recording_indicator
+            or not self.recording_indicator.winfo_exists()
+            or self.recording_indicator_state != state
+        ):
+            self.build_recording_indicator(replay_active, recording_active)
         try:
-            self.recording_indicator_title.configure(text="▶  REC")
-            self.recording_indicator_detail.configure(text=detail)
-            width = 178
-            height = 58
+            count = int(replay_active) + int(recording_active)
+            width = 50 * count + 8 * max(0, count - 1)
+            height = 50
             bounds = self.current_overlay_bounds()
-            x = bounds["left"] + max(0, bounds["width"] - width - 34)
-            y = bounds["top"] + max(0, bounds["height"] - height - 42)
+            x = bounds["left"] + max(0, bounds["width"] - width - 26)
+            y = bounds["top"] + max(0, bounds["height"] - height - 30)
             self.recording_indicator.geometry(f"{width}x{height}+{x}+{y}")
-            self.show_window_game_overlay(self.recording_indicator, click_through=self.use_fullscreen_safe_hud())
+            self.show_window_game_overlay(self.recording_indicator, click_through=True)
         except tk.TclError:
             self.recording_indicator = None
+            self.recording_indicator_state = None
 
-    def build_recording_indicator(self):
+    def build_recording_indicator(self, replay_active, recording_active):
+        self.hide_recording_indicator()
         indicator = tk.Toplevel(self.root)
         indicator.withdraw()
         self.recording_indicator = indicator
+        self.recording_indicator_state = (bool(replay_active), bool(recording_active))
         indicator.overrideredirect(True)
-        indicator.configure(bg="#050705")
+        transparent = "#010203"
+        indicator.configure(bg=transparent)
         indicator.attributes("-topmost", True)
         try:
-            indicator.attributes("-alpha", 0.88)
+            indicator.attributes("-alpha", 0.92)
+            if os.name == "nt":
+                indicator.attributes("-transparentcolor", transparent)
         except tk.TclError:
             pass
-        frame = tk.Frame(indicator, bg="#070907", highlightbackground="#1c241c", highlightthickness=1)
-        frame.pack(fill="both", expand=True)
-        tk.Frame(frame, bg="#76b900", width=4).pack(side="left", fill="y")
-        text_frame = tk.Frame(frame, bg="#070907")
-        text_frame.pack(side="left", fill="both", expand=True, padx=14, pady=8)
-        self.recording_indicator_title = tk.Label(
-            text_frame,
-            text="▶  REC",
-            bg="#070907",
-            fg="#76b900",
-            anchor="w",
-            font=("Segoe UI Symbol", 11, "bold"),
-        )
-        self.recording_indicator_title.pack(fill="x", anchor="w")
-        self.recording_indicator_detail = tk.Label(
-            text_frame,
-            text="00:00",
-            bg="#070907",
-            fg="#f4f4f4",
-            anchor="w",
-            font=("Segoe UI", 9, "bold"),
-        )
-        self.recording_indicator_detail.pack(fill="x", anchor="w", pady=(2, 0))
+        row = tk.Frame(indicator, bg=transparent)
+        row.pack(fill="both", expand=True)
+        states = []
+        if replay_active:
+            states.append(("replay", "#80d51a"))
+        if recording_active:
+            states.append(("record", "#ff4f64"))
+        for index, (icon_key, color) in enumerate(states):
+            tile = tk.Frame(
+                row,
+                bg="#090d0b",
+                width=50,
+                height=50,
+                highlightbackground="#32402d" if icon_key == "replay" else "#553039",
+                highlightthickness=1,
+            )
+            tile.pack(side="left", padx=(0 if index == 0 else 8, 0))
+            tile.pack_propagate(False)
+            canvas = tk.Canvas(tile, width=30, height=30, bg="#090d0b", highlightthickness=0, bd=0)
+            canvas.place(relx=0.5, rely=0.5, anchor="center")
+            self.draw_dashboard_icon(canvas, icon_key, 30, color)
+        indicator._shadowclip_status_icons = states
 
     def hide_recording_indicator(self):
         if self.recording_indicator and self.recording_indicator.winfo_exists():
@@ -13242,8 +14153,7 @@ class ShadowClipApp:
             except tk.TclError:
                 pass
         self.recording_indicator = None
-        self.recording_indicator_title = None
-        self.recording_indicator_detail = None
+        self.recording_indicator_state = None
 
     def update_tray_status(self):
         states = []
@@ -13256,6 +14166,7 @@ class ShadowClipApp:
         if self.tray:
             self.tray.set_tooltip(tooltip)
         self.refresh_status_panel()
+        self.update_recording_indicator()
         if not self.root.state() == "withdrawn":
             self.status_var.set(tooltip)
 
@@ -13300,8 +14211,12 @@ class ShadowClipApp:
                 self.update_tray_status()
             if message == "Replay buffer started.":
                 self.notify_user("Replay started", "Replay buffer is running.")
+                self.show_event_toast("Instant Replay is on", "Replay buffer is running.", "replay")
+                self.update_recording_indicator()
             elif message == "Stopped replay.":
                 self.notify_user("Replay stopped", "Replay buffer stopped.")
+                self.show_event_toast("Instant Replay is off", "Replay buffer stopped.", "stop")
+                self.update_recording_indicator()
             elif message.startswith("Recording started:"):
                 self.notify_user("Recording started", message)
                 self.show_event_toast("Recording has started", "Full recording is now running.", "record")
@@ -13309,11 +14224,11 @@ class ShadowClipApp:
             elif message == "Stopped recording.":
                 self.notify_user("Recording stopped", "Full recording stopped.")
                 self.show_event_toast("Recording has stopped", "Full recording was saved.", "stop")
-                self.hide_recording_indicator()
+                self.update_recording_indicator()
             elif message == "Forced recording to stop.":
                 self.notify_user("Recording stopped", "Full recording stopped.")
                 self.show_event_toast("Recording has stopped", "Full recording was stopped.", "stop")
-                self.hide_recording_indicator()
+                self.update_recording_indicator()
             elif message.startswith("Clip saved"):
                 self.notify_user("Clip saved", message)
                 clip_detail = "Replay clip was saved."
@@ -13325,6 +14240,7 @@ class ShadowClipApp:
                     self.refresh_overlay_gallery()
             elif message.startswith("Clip save failed"):
                 self.notify_user("Clip save failed", message)
+                self.show_event_toast("Clip was not saved", message, "warning")
             elif message.startswith("OBS clip save failed:"):
                 detail = message.split(":", 1)[1].strip() if ":" in message else message
                 self.notify_user("Clip save failed", detail)
