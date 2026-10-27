@@ -40,7 +40,7 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.23-rc11"
+APP_VERSION = "0.1.23-rc13"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_PREFIX = "ShadowClipSetup"
@@ -822,6 +822,7 @@ def media_kind_for_path(path):
 
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+BELOW_NORMAL_PRIORITY_CLASS = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 ERROR_ALREADY_EXISTS = 183
 FO_DELETE = 3
 FOF_SILENT = 0x0004
@@ -888,6 +889,7 @@ def move_path_to_recycle_bin(path, owner_hwnd=None):
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_MOUSEACTIVATE = 0x0021
+WM_NCHITTEST = 0x0084
 WM_QUIT = 0x0012
 WM_CONTEXTMENU = 0x007B
 WM_COMMAND = 0x0111
@@ -917,6 +919,7 @@ WS_MAXIMIZEBOX = 0x00010000
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_DLGMODALFRAME = 0x00000001
 WS_EX_CLIENTEDGE = 0x00000200
@@ -933,6 +936,7 @@ SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 SWP_NOOWNERZORDER = 0x0200
 MA_NOACTIVATE = 3
+HTTRANSPARENT = -1
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 VK_F11 = 0x7A
@@ -1673,6 +1677,47 @@ def unique_destination_path(path):
         if not candidate.exists():
             return candidate
     return path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
+
+
+def mp4_top_level_box_types(path, max_boxes=100_000):
+    path = Path(path)
+    box_types = []
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as handle:
+            offset = 0
+            while offset + 8 <= file_size and len(box_types) < max_boxes:
+                handle.seek(offset)
+                header = handle.read(8)
+                if len(header) != 8:
+                    break
+                box_size, raw_type = struct.unpack(">I4s", header)
+                header_size = 8
+                if box_size == 1:
+                    extended_size = handle.read(8)
+                    if len(extended_size) != 8:
+                        break
+                    box_size = struct.unpack(">Q", extended_size)[0]
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+                if box_size < header_size or offset + box_size > file_size:
+                    break
+                box_types.append(raw_type.decode("ascii", errors="replace"))
+                offset += box_size
+    except OSError:
+        return []
+    return box_types
+
+
+def mp4_needs_seek_finalization(path):
+    path = Path(path)
+    if path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+        return False
+    box_types = mp4_top_level_box_types(path)
+    if "moov" not in box_types or "mdat" not in box_types:
+        return True
+    return "moof" in box_types or box_types.index("moov") > box_types.index("mdat")
 
 
 def explorer_select_parameters(path):
@@ -3878,17 +3923,18 @@ PeakMeterType=0
             raise RuntimeError("OBS did not report a saved replay path.")
 
         output = self.organize_saved_obs_media(Path(saved_path))
-        self.last_clip_path = output
-        now = time.time()
-        self.last_clip_saved_at = now
-        self.log(f"Clip saved (OBS replay): {output}")
-        self.schedule_output_storage_cleanup()
         if bool(self.config.get("reset_replay_after_clip", True)):
             try:
                 self.reset_obs_replay_buffer(client)
                 self.log("Replay window reset; the next clip will save only new OBS replay time.")
             except Exception as exc:
                 self.log(f"OBS replay reset failed: {exc}")
+        output = self.finalize_obs_media_for_seeking(output, "Clip")
+        self.last_clip_path = output
+        now = time.time()
+        self.last_clip_saved_at = now
+        self.log(f"Clip saved (OBS replay): {output}")
+        self.schedule_output_storage_cleanup()
 
     def start_obs_recording(self):
         if self.record_proc and self.record_proc.poll() is None:
@@ -3950,8 +3996,20 @@ PeakMeterType=0
         self.recording_uses_separate_audio = False
         self.recording_audio_owned = False
         if output_path:
-            output_path = str(self.organize_saved_obs_media(Path(output_path)))
-            self.log(f"OBS recording saved: {output_path}")
+            output = self.organize_saved_obs_media(Path(output_path))
+            self.log("Recording capture stopped; finalizing seekable playback...")
+            threading.Thread(
+                target=self.finalize_obs_recording,
+                args=(output,),
+                daemon=True,
+            ).start()
+        else:
+            self.schedule_output_storage_cleanup()
+            self.log("Stopped recording.")
+
+    def finalize_obs_recording(self, output):
+        output = self.finalize_obs_media_for_seeking(output, "Recording")
+        self.log(f"OBS recording saved: {output}")
         self.schedule_output_storage_cleanup()
         self.log("Stopped recording.")
 
@@ -4824,6 +4882,88 @@ PeakMeterType=0
         if output is None or Path(output).suffix.casefold() in {".mp4", ".m4v", ".mov"}:
             args += ["-movflags", "+faststart"]
         return args
+
+    def finalize_obs_media_for_seeking(self, media_path, context_label="Media"):
+        media_path = Path(media_path)
+        if not media_path.exists() or not mp4_needs_seek_finalization(media_path):
+            return media_path
+
+        try:
+            ffmpeg = self.require_ffmpeg()
+        except Exception as exc:
+            self.log(f"{context_label} seek finalization skipped; original file kept: {exc}")
+            return media_path
+
+        try:
+            source_size = media_path.stat().st_size
+            free_space = shutil.disk_usage(media_path.parent).free
+        except OSError as exc:
+            self.log(f"{context_label} seek finalization skipped; original file kept: {exc}")
+            return media_path
+        required_space = source_size + (64 * 1024 * 1024)
+        if free_space < required_space:
+            self.log(
+                f"{context_label} seek finalization skipped; original file kept because "
+                f"{required_space / (1024 ** 3):.1f} GB temporary free space is required."
+            )
+            return media_path
+
+        temp_path = media_path.with_name(
+            f".{media_path.stem}.{uuid.uuid4().hex[:8]}.seekable{media_path.suffix}"
+        )
+        log_path = self.logs_dir / timestamp_name("seek_finalize", "log")
+        source_duration = self.probe_duration(media_path)
+        source_has_audio = self.has_audio_stream(media_path)
+        self.log(f"Finalizing {context_label.casefold()} for seekable playback...")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-y",
+            "-i", str(media_path),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-map_metadata", "0",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(temp_path),
+        ]
+        try:
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log_handle,
+                    creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                )
+            if result.returncode != 0 or not temp_path.exists():
+                raise RuntimeError(f"FFmpeg exited with code {result.returncode}. See log: {log_path}")
+            if not self.has_video_stream(temp_path):
+                raise RuntimeError(f"Finalized file has no video stream. See log: {log_path}")
+            if source_has_audio and not self.has_audio_stream(temp_path):
+                raise RuntimeError(f"Finalized file has no audio stream. See log: {log_path}")
+            output_duration = self.probe_duration(temp_path)
+            if source_duration is not None and output_duration is not None:
+                allowed_delta = max(0.5, source_duration * 0.002)
+                if abs(source_duration - output_duration) > allowed_delta:
+                    raise RuntimeError(
+                        f"Finalized duration changed from {source_duration:.3f}s to "
+                        f"{output_duration:.3f}s. See log: {log_path}"
+                    )
+            if mp4_needs_seek_finalization(temp_path):
+                raise RuntimeError(f"Finalized MP4 index is still not seekable. See log: {log_path}")
+            replace_with_retries(temp_path, media_path)
+            self.log(f"{context_label} finalized for seekable playback.")
+        except Exception as exc:
+            self.log(f"{context_label} seek finalization failed; original file kept: {exc}")
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        return media_path
 
     def build_media_trim_command(
         self,
@@ -5990,6 +6130,7 @@ class ShadowClipApp:
         self.manager = FfmpegManager(self.config, self.threadsafe_log)
         self.log_queue = queue.Queue()
         self.recent_log_lines = []
+        self.ui_log_line_count = 0
         self.icon_images = {}
         self.home_last_clip_preview_image = None
         self.home_last_clip_preview_signature = None
@@ -6051,6 +6192,7 @@ class ShadowClipApp:
         self.recording_indicator = None
         self.recording_indicator_state = None
         self.noactivate_window_procs = {}
+        self.click_through_hwnds = set()
         self.fullscreen_capture_signature = None
         self.fullscreen_capture_pending_signature = None
         self.fullscreen_capture_restart_after_id = None
@@ -7871,6 +8013,7 @@ class ShadowClipApp:
 
     def clear_log_view(self):
         self.recent_log_lines = []
+        self.ui_log_line_count = 0
         if hasattr(self, "log_text"):
             try:
                 self.log_text.configure(state="normal")
@@ -8333,7 +8476,12 @@ class ShadowClipApp:
         self.clip_gallery_thumbnail_pending.discard(signature)
         key = item["path_key"]
         if metadata:
-            self.clip_gallery_metadata_cache[signature[:3]] = metadata
+            metadata_key = signature[:3]
+            self.clip_gallery_metadata_cache.pop(metadata_key, None)
+            self.clip_gallery_metadata_cache[metadata_key] = metadata
+            while len(self.clip_gallery_metadata_cache) > 512:
+                oldest_key = next(iter(self.clip_gallery_metadata_cache))
+                self.clip_gallery_metadata_cache.pop(oldest_key, None)
         label_entry = self.clip_gallery_metadata_labels.get(key)
         if label_entry and label_entry[1] == signature:
             label = label_entry[0]
@@ -8353,10 +8501,13 @@ class ShadowClipApp:
 
     def load_clip_gallery_thumbnail(self, key, canvas, signature, thumbnail_path):
         try:
-            image = self.clip_gallery_thumbnail_images.get(signature)
+            image = self.clip_gallery_thumbnail_images.pop(signature, None)
             if image is None:
                 image = tk.PhotoImage(file=str(thumbnail_path))
-                self.clip_gallery_thumbnail_images[signature] = image
+            self.clip_gallery_thumbnail_images[signature] = image
+            while len(self.clip_gallery_thumbnail_images) > 72:
+                oldest_signature = next(iter(self.clip_gallery_thumbnail_images))
+                self.clip_gallery_thumbnail_images.pop(oldest_signature, None)
             canvas._shadowclip_preview_image = image
             canvas._shadowclip_placeholder = ""
             self.redraw_clip_card_preview(canvas)
@@ -12307,15 +12458,34 @@ class ShadowClipApp:
             "height": height,
         }
 
-    def install_noactivate_mouse_filter(self, window):
+    def native_window_handles(self, window):
+        if os.name != "nt" or not window or not window.winfo_exists():
+            return []
+        try:
+            window.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetClassNameW.restype = ctypes.c_int
+            handles = []
+            hwnd_value = int(window.winfo_id())
+            while hwnd_value and hwnd_value not in handles:
+                handles.append(hwnd_value)
+                class_name = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(wintypes.HWND(hwnd_value), class_name, len(class_name))
+                if class_name.value == "TkTopLevel":
+                    break
+                parent = user32.GetParent(wintypes.HWND(hwnd_value))
+                hwnd_value = int(parent or 0)
+            return handles
+        except Exception:
+            return []
+
+    def install_noactivate_mouse_filter(self, window, click_through=False):
         if os.name != "nt" or not window or not window.winfo_exists():
             return
         try:
-            window.update_idletasks()
-            hwnd = wintypes.HWND(window.winfo_id())
-            hwnd_key = int(hwnd.value or 0)
-            if not hwnd_key or hwnd_key in self.noactivate_window_procs:
-                return
             user32 = ctypes.windll.user32
             try:
                 get_window_long = user32.GetWindowLongPtrW
@@ -12335,21 +12505,44 @@ class ShadowClipApp:
                 wintypes.LPARAM,
             ]
             user32.CallWindowProcW.restype = LRESULT
-            old_proc = int(get_window_long(hwnd, GWLP_WNDPROC))
+            for hwnd_key in self.native_window_handles(window):
+                if click_through:
+                    self.click_through_hwnds.add(hwnd_key)
+                else:
+                    self.click_through_hwnds.discard(hwnd_key)
+                if hwnd_key in self.noactivate_window_procs:
+                    continue
+                hwnd = wintypes.HWND(hwnd_key)
+                old_proc = int(get_window_long(hwnd, GWLP_WNDPROC))
 
-            def noactivate_proc(proc_hwnd, message, wparam, lparam):
-                if message == WM_MOUSEACTIVATE:
-                    return MA_NOACTIVATE
-                return user32.CallWindowProcW(old_proc, proc_hwnd, message, wparam, lparam)
+                def make_noactivate_proc(original_proc, key):
+                    def noactivate_proc(proc_hwnd, message, wparam, lparam):
+                        if message == WM_NCHITTEST and key in self.click_through_hwnds:
+                            return HTTRANSPARENT
+                        if message == WM_MOUSEACTIVATE:
+                            return MA_NOACTIVATE
+                        return user32.CallWindowProcW(original_proc, proc_hwnd, message, wparam, lparam)
 
-            callback = WNDPROC(noactivate_proc)
-            set_window_long(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p).value)
-            self.noactivate_window_procs[hwnd_key] = (old_proc, callback)
-            window.bind(
-                "<Destroy>",
-                lambda event, key=hwnd_key: self.noactivate_window_procs.pop(key, None),
-                add="+",
-            )
+                    return WNDPROC(noactivate_proc)
+
+                callback = make_noactivate_proc(old_proc, hwnd_key)
+                set_window_long(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p).value)
+                self.noactivate_window_procs[hwnd_key] = (old_proc, callback)
+
+                def cleanup_native_filter(_event, key=hwnd_key):
+                    entry = self.noactivate_window_procs.pop(key, None)
+                    self.click_through_hwnds.discard(key)
+                    if entry and user32.IsWindow(wintypes.HWND(key)):
+                        try:
+                            set_window_long(wintypes.HWND(key), GWLP_WNDPROC, entry[0])
+                        except Exception:
+                            pass
+
+                window.bind(
+                    "<Destroy>",
+                    cleanup_native_filter,
+                    add="+",
+                )
         except Exception:
             pass
 
@@ -12358,8 +12551,7 @@ class ShadowClipApp:
             return
         try:
             window.update_idletasks()
-            self.install_noactivate_mouse_filter(window)
-            hwnd = wintypes.HWND(window.winfo_id())
+            self.install_noactivate_mouse_filter(window, click_through=click_through)
             user32 = ctypes.windll.user32
             try:
                 get_window_long = user32.GetWindowLongPtrW
@@ -12371,13 +12563,6 @@ class ShadowClipApp:
             get_window_long.restype = ctypes.c_ssize_t
             set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
             set_window_long.restype = ctypes.c_ssize_t
-            style = int(get_window_long(hwnd, GWL_EXSTYLE))
-            style |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-            if click_through:
-                style |= WS_EX_TRANSPARENT
-            else:
-                style &= ~WS_EX_TRANSPARENT
-            set_window_long(hwnd, GWL_EXSTYLE, style)
             user32.SetWindowPos.argtypes = [
                 wintypes.HWND,
                 wintypes.HWND,
@@ -12388,15 +12573,32 @@ class ShadowClipApp:
                 wintypes.UINT,
             ]
             user32.SetWindowPos.restype = wintypes.BOOL
-            user32.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
+            handles = self.native_window_handles(window)
+            for hwnd_key in handles:
+                hwnd = wintypes.HWND(hwnd_key)
+                style = int(get_window_long(hwnd, GWL_EXSTYLE))
+                style |= WS_EX_NOACTIVATE
+                if click_through:
+                    style |= WS_EX_TRANSPARENT
+                else:
+                    style &= ~WS_EX_TRANSPARENT
+                set_window_long(hwnd, GWL_EXSTYLE, style)
+            if handles:
+                top_level_hwnd = wintypes.HWND(handles[-1])
+                style = int(get_window_long(top_level_hwnd, GWL_EXSTYLE))
+                style |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED
+                if click_through:
+                    style |= WS_EX_TRANSPARENT
+                set_window_long(top_level_hwnd, GWL_EXSTYLE, style)
+                user32.SetWindowPos(
+                    top_level_hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                )
         except Exception:
             pass
 
@@ -14260,17 +14462,24 @@ class ShadowClipApp:
         self.log_queue.put(str(message))
 
     def drain_log_queue(self):
-        while True:
+        processed = 0
+        while processed < 100:
             try:
                 message = self.log_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             stamp = datetime.now().strftime("%H:%M:%S")
             line = f"[{stamp}] {message}\n"
             self.recent_log_lines.append(f"{stamp}    {message}")
             self.recent_log_lines = self.recent_log_lines[-24:]
             self.log_text.configure(state="normal")
             self.log_text.insert("end", line)
+            self.ui_log_line_count += 1
+            if self.ui_log_line_count > 2200:
+                remove_count = self.ui_log_line_count - 2000
+                self.log_text.delete("1.0", f"{remove_count + 1}.0")
+                self.ui_log_line_count -= remove_count
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
             self.status_var.set(message)
@@ -14326,7 +14535,8 @@ class ShadowClipApp:
                 detail = message.split(":", 1)[1].strip() if ":" in message else message
                 self.notify_user("Clip save failed", detail)
                 self.show_event_toast("Clip was not saved", detail, "warning")
-        self.root.after(100, self.drain_log_queue)
+        next_delay = 10 if not self.log_queue.empty() else 250
+        self.root.after(next_delay, self.drain_log_queue)
 
     def on_close(self):
         if self.capture_self_test_running:

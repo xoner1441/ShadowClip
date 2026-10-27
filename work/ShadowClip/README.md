@@ -41,6 +41,8 @@ ShadowClip is a Windows clip recorder MVP. It records the full desktop, one moni
 - Integrated clip editor with start/end previews, timeline trimming, lossless fast export, frame-accurate export, and optional original-file replacement
 - Open, edit, reveal, rename, or move saved clips and recordings to the Windows Recycle Bin directly in ShadowClip
 - Faster clip completion through immediate OBS save detection and non-blocking storage cleanup
+- Automatic lossless MP4 finalization after OBS saves so Windows players can seek clips and recordings immediately
+- Bounded UI log and gallery preview caches for stable RAM use during long sessions
 - In-HUD clip gallery with recent clips, play buttons, reveal buttons, and a `Play Last` action
 - Live normal-recording timer and file size in the control center, HUD recording tile, and optional bottom-right REC indicator
 - Optional game/app folders for clips and recordings, similar to ShadowPlay's game grouping
