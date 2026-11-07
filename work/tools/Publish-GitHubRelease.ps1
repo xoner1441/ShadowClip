@@ -1,6 +1,6 @@
 param(
     [string]$Repository = "xoner1441/ShadowClip",
-    [string]$Version = "0.1.23-rc13",
+    [string]$Version = "0.1.23-rc16",
     [string]$AssetPath,
     [string]$ReleaseNotesPath,
     [switch]$Draft,

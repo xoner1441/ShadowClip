@@ -1,18 +1,18 @@
 #define MyAppName "ShadowClip"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.23-rc13"
+#define MyAppVersion "0.1.23-rc16"
 #endif
 #ifndef MyAppVersionNumeric
-#define MyAppVersionNumeric "0.1.23.13"
+#define MyAppVersionNumeric "0.1.23.16"
 #endif
 #ifndef SourceDir
-#define SourceDir "..\..\outputs\ShadowClipExeControlCenter_0.1.23-rc13"
+#define SourceDir "..\..\outputs\ShadowClipExeControlCenter_0.1.23-rc16"
 #endif
 #ifndef InstallerConfig
 #define InstallerConfig "shadowclip.installer.config.json"
 #endif
 #ifndef ReleaseNotesFile
-#define ReleaseNotesFile "RELEASE_NOTES_0.1.23-rc13.md"
+#define ReleaseNotesFile "RELEASE_NOTES_0.1.23-rc16.md"
 #endif
 #ifndef OutputDir
 #define OutputDir "..\..\outputs\installer"

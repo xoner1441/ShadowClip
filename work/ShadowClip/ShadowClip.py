@@ -40,7 +40,8 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.23-rc13"
+APP_VERSION = "0.1.23-rc16"
+OBS_WORKING_DIR_NAME = ".shadowclip-working"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET_PREFIX = "ShadowClipSetup"
@@ -1668,6 +1669,22 @@ def replace_with_retries(temp_path, target_path, attempts=20, base_delay=0.035):
         raise last_error
 
 
+def mark_directory_hidden(path):
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetFileAttributesW.restype = wintypes.DWORD
+        kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        kernel32.SetFileAttributesW.restype = wintypes.BOOL
+        attributes = int(kernel32.GetFileAttributesW(str(path)))
+        if attributes != 0xFFFFFFFF:
+            kernel32.SetFileAttributesW(str(path), attributes | 0x2 | 0x2000)
+    except Exception:
+        pass
+
+
 def unique_destination_path(path):
     path = Path(path)
     if not path.exists():
@@ -1834,12 +1851,301 @@ class MonitorInfoEx(ctypes.Structure):
     ]
 
 
+class PointL(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class PrinterDevModeFields(ctypes.Structure):
+    _fields_ = [
+        ("dmOrientation", wintypes.SHORT),
+        ("dmPaperSize", wintypes.SHORT),
+        ("dmPaperLength", wintypes.SHORT),
+        ("dmPaperWidth", wintypes.SHORT),
+        ("dmScale", wintypes.SHORT),
+        ("dmCopies", wintypes.SHORT),
+        ("dmDefaultSource", wintypes.SHORT),
+        ("dmPrintQuality", wintypes.SHORT),
+    ]
+
+
+class DisplayDevModeFields(ctypes.Structure):
+    _fields_ = [
+        ("dmPosition", PointL),
+        ("dmDisplayOrientation", wintypes.DWORD),
+        ("dmDisplayFixedOutput", wintypes.DWORD),
+    ]
+
+
+class DevModeFields(ctypes.Union):
+    _fields_ = [
+        ("printer", PrinterDevModeFields),
+        ("display", DisplayDevModeFields),
+    ]
+
+
+class DevModeW(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", wintypes.WCHAR * CCHDEVICENAME),
+        ("dmSpecVersion", wintypes.WORD),
+        ("dmDriverVersion", wintypes.WORD),
+        ("dmSize", wintypes.WORD),
+        ("dmDriverExtra", wintypes.WORD),
+        ("dmFields", wintypes.DWORD),
+        ("fields", DevModeFields),
+        ("dmColor", wintypes.SHORT),
+        ("dmDuplex", wintypes.SHORT),
+        ("dmYResolution", wintypes.SHORT),
+        ("dmTTOption", wintypes.SHORT),
+        ("dmCollate", wintypes.SHORT),
+        ("dmFormName", wintypes.WCHAR * 32),
+        ("dmLogPixels", wintypes.WORD),
+        ("dmBitsPerPel", wintypes.DWORD),
+        ("dmPelsWidth", wintypes.DWORD),
+        ("dmPelsHeight", wintypes.DWORD),
+        ("dmDisplayFlags", wintypes.DWORD),
+        ("dmDisplayFrequency", wintypes.DWORD),
+        ("dmICMMethod", wintypes.DWORD),
+        ("dmICMIntent", wintypes.DWORD),
+        ("dmMediaType", wintypes.DWORD),
+        ("dmDitherType", wintypes.DWORD),
+        ("dmReserved1", wintypes.DWORD),
+        ("dmReserved2", wintypes.DWORD),
+        ("dmPanningWidth", wintypes.DWORD),
+        ("dmPanningHeight", wintypes.DWORD),
+    ]
+
+
+class LocallyUniqueIdentifier(ctypes.Structure):
+    _fields_ = [
+        ("LowPart", wintypes.DWORD),
+        ("HighPart", wintypes.LONG),
+    ]
+
+
+class DisplayConfigPathSourceModeIndexes(ctypes.Structure):
+    _fields_ = [
+        ("cloneGroupId", wintypes.WORD),
+        ("sourceModeInfoIdx", wintypes.WORD),
+    ]
+
+
+class DisplayConfigPathSourceModeInfo(ctypes.Union):
+    _fields_ = [
+        ("modeInfoIdx", wintypes.DWORD),
+        ("virtualMode", DisplayConfigPathSourceModeIndexes),
+    ]
+
+
+class DisplayConfigPathSourceInfo(ctypes.Structure):
+    _fields_ = [
+        ("adapterId", LocallyUniqueIdentifier),
+        ("id", wintypes.DWORD),
+        ("modeInfo", DisplayConfigPathSourceModeInfo),
+        ("statusFlags", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigPathTargetModeIndexes(ctypes.Structure):
+    _fields_ = [
+        ("desktopModeInfoIdx", wintypes.WORD),
+        ("targetModeInfoIdx", wintypes.WORD),
+    ]
+
+
+class DisplayConfigPathTargetModeInfo(ctypes.Union):
+    _fields_ = [
+        ("modeInfoIdx", wintypes.DWORD),
+        ("virtualMode", DisplayConfigPathTargetModeIndexes),
+    ]
+
+
+class DisplayConfigRational(ctypes.Structure):
+    _fields_ = [
+        ("Numerator", wintypes.DWORD),
+        ("Denominator", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigPathTargetInfo(ctypes.Structure):
+    _fields_ = [
+        ("adapterId", LocallyUniqueIdentifier),
+        ("id", wintypes.DWORD),
+        ("modeInfo", DisplayConfigPathTargetModeInfo),
+        ("outputTechnology", wintypes.DWORD),
+        ("rotation", wintypes.DWORD),
+        ("scaling", wintypes.DWORD),
+        ("refreshRate", DisplayConfigRational),
+        ("scanLineOrdering", wintypes.DWORD),
+        ("targetAvailable", wintypes.BOOL),
+        ("statusFlags", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigPathInfo(ctypes.Structure):
+    _fields_ = [
+        ("sourceInfo", DisplayConfigPathSourceInfo),
+        ("targetInfo", DisplayConfigPathTargetInfo),
+        ("flags", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigDeviceInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("size", wintypes.DWORD),
+        ("adapterId", LocallyUniqueIdentifier),
+        ("id", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigSourceDeviceName(ctypes.Structure):
+    _fields_ = [
+        ("header", DisplayConfigDeviceInfoHeader),
+        ("viewGdiDeviceName", wintypes.WCHAR * CCHDEVICENAME),
+    ]
+
+
+class DisplayConfig2DRegion(ctypes.Structure):
+    _fields_ = [("cx", wintypes.DWORD), ("cy", wintypes.DWORD)]
+
+
+class DisplayConfigVideoSignalInfo(ctypes.Structure):
+    _fields_ = [
+        ("pixelRate", ctypes.c_ulonglong),
+        ("hSyncFreq", DisplayConfigRational),
+        ("vSyncFreq", DisplayConfigRational),
+        ("activeSize", DisplayConfig2DRegion),
+        ("totalSize", DisplayConfig2DRegion),
+        ("videoStandard", wintypes.DWORD),
+        ("scanLineOrdering", wintypes.DWORD),
+    ]
+
+
+class DisplayConfigTargetMode(ctypes.Structure):
+    _fields_ = [("targetVideoSignalInfo", DisplayConfigVideoSignalInfo)]
+
+
+class DisplayConfigTargetPreferredMode(ctypes.Structure):
+    _fields_ = [
+        ("header", DisplayConfigDeviceInfoHeader),
+        ("width", wintypes.DWORD),
+        ("height", wintypes.DWORD),
+        ("targetMode", DisplayConfigTargetMode),
+    ]
+
+
+def display_preferred_resolution(device_name):
+    """Return the connected monitor's preferred hardware mode."""
+    if os.name != "nt" or not device_name:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetDisplayConfigBufferSizes.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetDisplayConfigBufferSizes.restype = wintypes.LONG
+        user32.QueryDisplayConfig.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(DisplayConfigPathInfo),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        user32.QueryDisplayConfig.restype = wintypes.LONG
+        user32.DisplayConfigGetDeviceInfo.argtypes = [ctypes.POINTER(DisplayConfigDeviceInfoHeader)]
+        user32.DisplayConfigGetDeviceInfo.restype = wintypes.LONG
+
+        active_paths = 0x2
+        path_count = wintypes.DWORD()
+        mode_count = wintypes.DWORD()
+        if user32.GetDisplayConfigBufferSizes(active_paths, ctypes.byref(path_count), ctypes.byref(mode_count)) != 0:
+            return None
+        if not path_count.value:
+            return None
+        paths = (DisplayConfigPathInfo * path_count.value)()
+        # Mode data is not inspected here. Reserve more than the native structure
+        # size so QueryDisplayConfig can still populate its required output table.
+        mode_buffer = ctypes.create_string_buffer(max(1, mode_count.value) * 128)
+        if user32.QueryDisplayConfig(
+            active_paths,
+            ctypes.byref(path_count),
+            paths,
+            ctypes.byref(mode_count),
+            ctypes.cast(mode_buffer, ctypes.c_void_p),
+            None,
+        ) != 0:
+            return None
+
+        target_device = str(device_name).strip().casefold()
+        for path in paths[:path_count.value]:
+            source_name = DisplayConfigSourceDeviceName()
+            source_name.header.type = 1
+            source_name.header.size = ctypes.sizeof(DisplayConfigSourceDeviceName)
+            source_name.header.adapterId = path.sourceInfo.adapterId
+            source_name.header.id = path.sourceInfo.id
+            if user32.DisplayConfigGetDeviceInfo(ctypes.byref(source_name.header)) != 0:
+                continue
+            if str(source_name.viewGdiDeviceName or "").strip().casefold() != target_device:
+                continue
+            preferred = DisplayConfigTargetPreferredMode()
+            preferred.header.type = 3
+            preferred.header.size = ctypes.sizeof(DisplayConfigTargetPreferredMode)
+            preferred.header.adapterId = path.targetInfo.adapterId
+            preferred.header.id = path.targetInfo.id
+            if user32.DisplayConfigGetDeviceInfo(ctypes.byref(preferred.header)) != 0:
+                return None
+            width = int(preferred.width or 0)
+            height = int(preferred.height or 0)
+            if width >= 320 and height >= 240:
+                return width, height
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def display_desktop_resolution(device_name):
+    """Return the persistent Windows desktop mode, not a game's temporary mode."""
+    if os.name != "nt" or not device_name:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.EnumDisplaySettingsExW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(DevModeW),
+            wintypes.DWORD,
+        ]
+        user32.EnumDisplaySettingsExW.restype = wintypes.BOOL
+        mode = DevModeW()
+        mode.dmSize = ctypes.sizeof(DevModeW)
+        if not user32.EnumDisplaySettingsExW(
+            str(device_name),
+            0xFFFFFFFE,
+            ctypes.byref(mode),
+            0,
+        ):
+            return None
+        width = int(mode.dmPelsWidth or 0)
+        height = int(mode.dmPelsHeight or 0)
+        if width < 320 or height < 240:
+            return None
+        return width, height
+    except Exception:
+        return None
+
+
 def enum_monitors():
     if os.name != "nt":
         return []
 
     monitors = []
     user32 = ctypes.windll.user32
+    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MonitorInfoEx)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
     monitor_enum_proc = ctypes.WINFUNCTYPE(
         wintypes.BOOL,
         wintypes.HMONITOR,
@@ -1849,8 +2155,8 @@ def enum_monitors():
     )
 
     def callback(hmonitor, hdc, rect_ptr, lparam):
-        info = MonitorInfo()
-        info.cbSize = ctypes.sizeof(MonitorInfo)
+        info = MonitorInfoEx()
+        info.cbSize = ctypes.sizeof(MonitorInfoEx)
         if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
             rect = info.rcMonitor
             width = rect.right - rect.left
@@ -1862,6 +2168,7 @@ def enum_monitors():
                 "width": int(width),
                 "height": int(height),
                 "primary": bool(info.dwFlags & 1),
+                "device": str(info.szDevice or "").strip(),
             })
         return True
 
@@ -2582,6 +2889,7 @@ class FfmpegManager:
         self.obs_replay_watchdog_grace_until = 0.0
         self.obs_canvas_mismatch_since = 0.0
         self.obs_canvas_restart_at = 0.0
+        self.obs_canvas_target_sizes = {}
         self.obs_capture_context_key = ""
         self.obs_capture_strategy = "auto"
         self.obs_capture_strategy_cache = {}
@@ -2925,8 +3233,9 @@ class FfmpegManager:
         return self.obs_client
 
     def obs_output_dir(self):
-        path = self.capture_output_dir()
+        path = self.output_dir() / OBS_WORKING_DIR_NAME
         path.mkdir(parents=True, exist_ok=True)
+        mark_directory_hidden(path)
         return path
 
     def obs_video_size(self):
@@ -2935,7 +3244,19 @@ class FfmpegManager:
             index = int(self.config.get("monitor_index", 0) or 0)
             index = max(0, min(index, len(monitors) - 1))
             monitor = monitors[index]
-            return int(monitor["width"]), int(monitor["height"])
+            current_size = int(monitor["width"]), int(monitor["height"])
+            device_name = str(monitor.get("device") or monitor_device_name_for_index(index) or "").strip()
+            target_key = device_name.casefold() or f"monitor:{index}"
+            cached_size = self.obs_canvas_target_sizes.get(target_key)
+            if cached_size:
+                return cached_size
+            target_size = (
+                display_preferred_resolution(device_name)
+                or display_desktop_resolution(device_name)
+                or current_size
+            )
+            self.obs_canvas_target_sizes[target_key] = target_size
+            return target_size
         return 1920, 1080
 
     def obs_ini_path(self, path):
@@ -3922,7 +4243,7 @@ PeakMeterType=0
         if not saved_path:
             raise RuntimeError("OBS did not report a saved replay path.")
 
-        output = self.organize_saved_obs_media(Path(saved_path))
+        output = Path(saved_path)
         if bool(self.config.get("reset_replay_after_clip", True)):
             try:
                 self.reset_obs_replay_buffer(client)
@@ -3930,6 +4251,7 @@ PeakMeterType=0
             except Exception as exc:
                 self.log(f"OBS replay reset failed: {exc}")
         output = self.finalize_obs_media_for_seeking(output, "Clip")
+        output = self.organize_saved_obs_media(output)
         self.last_clip_path = output
         now = time.time()
         self.last_clip_saved_at = now
@@ -3996,7 +4318,7 @@ PeakMeterType=0
         self.recording_uses_separate_audio = False
         self.recording_audio_owned = False
         if output_path:
-            output = self.organize_saved_obs_media(Path(output_path))
+            output = Path(output_path)
             self.log("Recording capture stopped; finalizing seekable playback...")
             threading.Thread(
                 target=self.finalize_obs_recording,
@@ -4009,6 +4331,7 @@ PeakMeterType=0
 
     def finalize_obs_recording(self, output):
         output = self.finalize_obs_media_for_seeking(output, "Recording")
+        output = self.organize_saved_obs_media(output)
         self.log(f"OBS recording saved: {output}")
         self.schedule_output_storage_cleanup()
         self.log("Stopped recording.")
@@ -4888,6 +5211,8 @@ PeakMeterType=0
         if not media_path.exists() or not mp4_needs_seek_finalization(media_path):
             return media_path
 
+        self.wait_for_media_file_stable(media_path)
+
         try:
             ffmpeg = self.require_ffmpeg()
         except Exception as exc:
@@ -4920,11 +5245,15 @@ PeakMeterType=0
             "-hide_banner",
             "-loglevel", "warning",
             "-y",
+            "-fflags", "+genpts+discardcorrupt",
+            "-err_detect", "ignore_err",
             "-i", str(media_path),
             "-map", "0:v:0",
             "-map", "0:a?",
-            "-map_metadata", "0",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
             "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             str(temp_path),
         ]
@@ -4944,7 +5273,7 @@ PeakMeterType=0
                 raise RuntimeError(f"Finalized file has no audio stream. See log: {log_path}")
             output_duration = self.probe_duration(temp_path)
             if source_duration is not None and output_duration is not None:
-                allowed_delta = max(0.5, source_duration * 0.002)
+                allowed_delta = max(2.0, source_duration * 0.005)
                 if abs(source_duration - output_duration) > allowed_delta:
                     raise RuntimeError(
                         f"Finalized duration changed from {source_duration:.3f}s to "
@@ -4964,6 +5293,29 @@ PeakMeterType=0
             except OSError:
                 pass
         return media_path
+
+    def wait_for_media_file_stable(self, media_path, timeout=15.0, stable_seconds=1.25):
+        media_path = Path(media_path)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        stable_since = None
+        previous_signature = None
+        while time.monotonic() < deadline:
+            try:
+                stat = media_path.stat()
+                signature = (int(stat.st_size), int(stat.st_mtime_ns))
+            except OSError:
+                signature = None
+            now = time.monotonic()
+            if signature and signature == previous_signature:
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= float(stable_seconds):
+                    return True
+            else:
+                previous_signature = signature
+                stable_since = None
+            time.sleep(0.25)
+        return False
 
     def build_media_trim_command(
         self,
@@ -5145,9 +5497,13 @@ PeakMeterType=0
 
     def organize_saved_obs_media(self, output):
         output = Path(output)
-        if not output.exists() or not bool(self.config.get("organize_clips_by_game", True)):
+        if not output.exists():
             return output
-        target_dir = self.capture_output_dir(prefer_cached_game=True)
+        target_dir = (
+            self.capture_output_dir(prefer_cached_game=True)
+            if bool(self.config.get("organize_clips_by_game", True))
+            else self.output_dir()
+        )
         try:
             if output.parent.resolve() == target_dir.resolve():
                 return output
@@ -5185,6 +5541,11 @@ PeakMeterType=0
             for path in output_dir.rglob("*"):
                 if not path.is_file() or path.suffix.casefold() not in MEDIA_EXTENSIONS:
                     continue
+                try:
+                    if OBS_WORKING_DIR_NAME in path.relative_to(output_dir).parts:
+                        continue
+                except (OSError, ValueError):
+                    pass
                 try:
                     modified = path.stat().st_mtime
                 except OSError:

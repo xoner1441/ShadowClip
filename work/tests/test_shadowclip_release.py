@@ -57,6 +57,93 @@ class ReleaseLogicTests(unittest.TestCase):
         )
         self.assertEqual(SHADOWCLIP.recommended_obs_replay_buffer_mb(120, 35), 640)
 
+    def test_obs_output_keeps_desktop_resolution_during_game_mode_switch(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.config = {"monitor_index": 0}
+        manager.obs_canvas_target_sizes = {}
+        monitors = [{
+            "index": 0,
+            "left": 0,
+            "top": 0,
+            "width": 1440,
+            "height": 1080,
+            "primary": True,
+            "device": r"\\.\DISPLAY1",
+        }]
+        with (
+            mock.patch.object(SHADOWCLIP, "enum_monitors", return_value=monitors),
+            mock.patch.object(
+                SHADOWCLIP,
+                "display_preferred_resolution",
+                return_value=(1920, 1080),
+            ),
+            mock.patch.object(
+                SHADOWCLIP,
+                "display_desktop_resolution",
+                return_value=(1440, 1080),
+            ),
+        ):
+            self.assertEqual(manager.obs_video_size(), (1920, 1080))
+
+    def test_obs_output_size_is_locked_for_the_shadowclip_session(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.config = {"monitor_index": 0}
+        manager.obs_canvas_target_sizes = {}
+        monitor = {
+            "index": 0,
+            "left": 0,
+            "top": 0,
+            "width": 1920,
+            "height": 1080,
+            "primary": True,
+            "device": r"\\.\DISPLAY1",
+        }
+        with (
+            mock.patch.object(SHADOWCLIP, "enum_monitors", return_value=[monitor]),
+            mock.patch.object(SHADOWCLIP, "display_preferred_resolution", return_value=(1920, 1080)),
+            mock.patch.object(SHADOWCLIP, "display_desktop_resolution", return_value=(1920, 1080)),
+        ):
+            self.assertEqual(manager.obs_video_size(), (1920, 1080))
+
+        monitor["width"] = 1440
+        with (
+            mock.patch.object(SHADOWCLIP, "enum_monitors", return_value=[monitor]),
+            mock.patch.object(SHADOWCLIP, "display_preferred_resolution", return_value=(1440, 1080)),
+            mock.patch.object(SHADOWCLIP, "display_desktop_resolution", return_value=(1440, 1080)),
+        ):
+            self.assertEqual(manager.obs_video_size(), (1920, 1080))
+
+    def test_obs_full_canvas_transform_stretches_source_to_output(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        with mock.patch.object(manager, "obs_live_canvas_size", return_value=(1920, 1080)):
+            transform = manager.obs_full_canvas_transform(object())
+        self.assertEqual(transform["boundsType"], "OBS_BOUNDS_STRETCH")
+        self.assertEqual(transform["boundsWidth"], 1920.0)
+        self.assertEqual(transform["boundsHeight"], 1080.0)
+        self.assertEqual(transform["cropLeft"], 0)
+        self.assertEqual(transform["cropRight"], 0)
+
+    def test_obs_working_media_is_hidden_from_library_until_published(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = dict(SHADOWCLIP.DEFAULT_CONFIG)
+            config.update({
+                "output_dir": temporary_directory,
+                "organize_clips_by_game": False,
+                "max_storage_gb": 0,
+            })
+            manager = SHADOWCLIP.FfmpegManager(config, lambda _message: None)
+            working_dir = manager.obs_output_dir()
+            raw_media = working_dir / "recording.mp4"
+            raw_media.write_bytes(b"raw")
+
+            self.assertEqual(working_dir.name, SHADOWCLIP.OBS_WORKING_DIR_NAME)
+            self.assertNotIn(raw_media, manager.all_media_paths())
+
+            published = manager.organize_saved_obs_media(raw_media)
+            self.assertEqual(published.parent, Path(temporary_directory))
+            self.assertTrue(published.exists())
+            self.assertIn(published, manager.all_media_paths())
+
     def test_standalone_and_combination_hotkeys(self):
         self.assertEqual(SHADOWCLIP.parse_hotkey_text("F9")[2], "F9")
         self.assertEqual(SHADOWCLIP.parse_hotkey_text("K")[2], "K")
