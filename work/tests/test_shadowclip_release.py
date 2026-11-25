@@ -53,7 +53,15 @@ class ReleaseLogicTests(unittest.TestCase):
         )
         self.assertEqual(
             SHADOWCLIP.recommended_video_bitrate_mbps(120, 1920, 1080, "high"),
-            70,
+            53,
+        )
+        self.assertEqual(
+            SHADOWCLIP.recommended_video_bitrate_mbps(240, 1920, 1080, "high"),
+            80,
+        )
+        self.assertEqual(
+            SHADOWCLIP.recommended_video_bitrate_mbps(120, 1920, 1080, "balanced"),
+            42,
         )
         self.assertEqual(SHADOWCLIP.recommended_obs_replay_buffer_mb(120, 35), 640)
 
@@ -627,6 +635,103 @@ class ReleaseLogicTests(unittest.TestCase):
         self.assertLessEqual(len(app.clip_gallery_thumbnail_images), 72)
         self.assertIn(signature, app.clip_gallery_thumbnail_images)
         self.assertIs(canvas._shadowclip_preview_image, app.clip_gallery_thumbnail_images[signature])
+
+    def test_clip_gallery_layout_fills_width_with_16_9_thumbnails(self):
+        self.assertEqual(SHADOWCLIP.clip_gallery_layout(920), (2, 452, 448, 252))
+        self.assertEqual(SHADOWCLIP.clip_gallery_layout(500)[0], 1)
+        self.assertEqual(SHADOWCLIP.clip_gallery_layout(1300)[0], 3)
+        self.assertEqual(SHADOWCLIP.clip_gallery_layout(4000)[0], 4)
+        for width in (300, 700, 920, 1080, 1300, 1900):
+            columns, card_width, thumb_width, thumb_height = SHADOWCLIP.clip_gallery_layout(width)
+            self.assertLessEqual(columns * card_width + (columns - 1) * 16, width + 1)
+            self.assertLessEqual(thumb_width, max(240, card_width))
+            self.assertEqual(thumb_height % 2, 0)
+
+    def test_output_resolution_downscales_but_never_upscales(self):
+        self.assertEqual(SHADOWCLIP.scaled_output_size(2560, 1440, "1080p"), (1920, 1080))
+        self.assertEqual(SHADOWCLIP.scaled_output_size(3840, 2160, "1440p"), (2560, 1440))
+        self.assertEqual(SHADOWCLIP.scaled_output_size(3440, 1440, "1080p"), (2580, 1080))
+        self.assertEqual(SHADOWCLIP.scaled_output_size(1920, 1080, "1440p"), (1920, 1080))
+        self.assertEqual(SHADOWCLIP.scaled_output_size(2560, 1440, "native"), (2560, 1440))
+        self.assertEqual(SHADOWCLIP.scaled_output_size(2560, 1440, "bogus"), (2560, 1440))
+
+    def test_overlay_strategy_uses_dxgi_on_desktop_and_wgc_for_games(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.obs_capture_strategy = "overlay_wgc"
+        self.assertEqual(manager.obs_display_capture_method("desktop_display"), 0)
+        self.assertEqual(manager.obs_display_capture_method("browser_display"), 0)
+        self.assertEqual(manager.obs_display_capture_method("game_capture"), 2)
+        manager.obs_capture_strategy = "display_wgc"
+        self.assertEqual(manager.obs_display_capture_method("desktop_display"), 2)
+        manager.obs_capture_strategy = "auto"
+        self.assertEqual(manager.obs_display_capture_method("game_capture"), 0)
+
+    def test_nvenc_advanced_settings_avoid_extra_gpu_passes(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.config = {"bitrate_mode": "target", "video_bitrate_mbps": 35, "max_bitrate_mbps": 50, "quality": 23}
+        settings = manager.obs_record_encoder_settings("h264_nvenc")
+        self.assertEqual(settings["rate_control"], "VBR")
+        self.assertEqual(settings["bitrate"], 35000)
+        self.assertEqual(settings["preset2"], "p4")
+        self.assertEqual(settings["multipass"], "disabled")
+        self.assertFalse(settings["lookahead"])
+        self.assertFalse(settings["psycho_aq"])
+        manager.config["bitrate_mode"] = "quality"
+        self.assertEqual(manager.obs_record_encoder_settings("h264_nvenc")["rate_control"], "CQP")
+
+    def test_obs_profile_uses_advanced_output_and_scaled_canvas(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.config = dict(SHADOWCLIP.DEFAULT_CONFIG, output_resolution="1080p")
+        manager.obs_advanced_output_disabled = False
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with (
+                mock.patch.object(manager, "obs_video_size", return_value=(2560, 1440)),
+                mock.patch.object(manager, "obs_output_dir", return_value=root / "out"),
+                mock.patch.object(manager, "resolve_video_encoder", return_value="h264_nvenc"),
+            ):
+                manager.write_obs_capture_profile_config(root)
+            profile = root / "config" / "obs-studio" / "basic" / "profiles" / "ShadowClip"
+            text = (profile / "basic.ini").read_text(encoding="utf-8")
+            self.assertIn("Mode=Advanced", text)
+            self.assertIn("RecEncoder=obs_nvenc_h264_tex", text)
+            self.assertIn("BaseCX=2560", text)
+            self.assertIn("OutputCX=1920", text)
+            self.assertIn("OutputCY=1080", text)
+            encoder = json.loads((profile / "recordEncoder.json").read_text(encoding="utf-8"))
+            self.assertEqual(encoder["preset2"], "p4")
+
+            manager.obs_advanced_output_disabled = True
+            with (
+                mock.patch.object(manager, "obs_video_size", return_value=(2560, 1440)),
+                mock.patch.object(manager, "obs_output_dir", return_value=root / "out"),
+                mock.patch.object(manager, "resolve_video_encoder", return_value="h264_nvenc"),
+            ):
+                manager.write_obs_capture_profile_config(root)
+            self.assertIn("Mode=Simple", (profile / "basic.ini").read_text(encoding="utf-8"))
+
+    def test_advanced_output_failure_falls_back_to_simple_once(self):
+        manager = object.__new__(SHADOWCLIP.FfmpegManager)
+        manager.obs_advanced_output_disabled = False
+        manager.log = mock.Mock()
+        manager.stop_obs_runtime = mock.Mock()
+        calls = []
+
+        def start():
+            calls.append(manager.obs_uses_advanced_output())
+            if len(calls) == 1:
+                raise RuntimeError("encoder failed")
+            return "ok"
+
+        self.assertEqual(manager.run_obs_start_with_output_fallback("replay start", start, False), "ok")
+        self.assertEqual(calls, [True, False])
+        manager.stop_obs_runtime.assert_called_once()
+
+        manager.obs_advanced_output_disabled = False
+        with self.assertRaises(RuntimeError):
+            manager.run_obs_start_with_output_fallback(
+                "replay start", mock.Mock(side_effect=RuntimeError("x")), True
+            )
 
 
 if __name__ == "__main__":

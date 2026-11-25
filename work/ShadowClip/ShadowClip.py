@@ -40,7 +40,7 @@ except Exception:
 
 
 APP_NAME = "ShadowClip"
-APP_VERSION = "0.1.23-rc16"
+APP_VERSION = "0.1.23-rc17"
 OBS_WORKING_DIR_NAME = ".shadowclip-working"
 UPDATE_REPO = "xoner1441/ShadowClip"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
@@ -81,7 +81,17 @@ OBS_SIMPLE_ENCODERS = {
     "h264_qsv": "qsv",
     "libx264": "x264",
 }
-AUTO_BITRATE_PRESETS = ("balanced", "high", "ultra")
+# Advanced-output encoder IDs registered by the bundled OBS 32 runtime.
+OBS_ADVANCED_ENCODERS = {
+    "h264_nvenc": "obs_nvenc_h264_tex",
+    "h264_amf": "h264_texture_amf",
+    "h264_qsv": "obs_qsv11_v2",
+    "libx264": "obs_x264",
+}
+OBS_GAME_BASE_MODES = frozenset({"game_capture", "minecraft_game_capture"})
+OUTPUT_RESOLUTION_VALUES = ("native", "1440p", "1080p", "900p", "720p")
+OUTPUT_RESOLUTION_HEIGHTS = {"1440p": 1440, "1080p": 1080, "900p": 900, "720p": 720}
+AUTO_BITRATE_PRESETS =("balanced", "high", "ultra")
 AUTO_BITRATE_PRESET_LABELS = {
     "balanced": "Balanced",
     "high": "High",
@@ -100,6 +110,7 @@ GAME_PROFILE_SETTING_KEYS = (
     "monitor_index",
     "window_title",
     "framerate",
+    "output_resolution",
     "clip_seconds",
     "segment_seconds",
     "video_encoder",
@@ -115,6 +126,74 @@ GAME_PROFILE_SETTING_KEYS = (
     "audio_offset_ms",
     "recording_audio_offset_ms",
 )
+
+
+def normalize_output_resolution(value):
+    resolution = str(value or "native").strip().casefold()
+    return resolution if resolution in OUTPUT_RESOLUTION_VALUES else "native"
+
+
+def scaled_output_size(base_width, base_height, resolution="native"):
+    """Downscale (never upscale) to the selected output height, keeping aspect ratio."""
+    width, height = int(base_width), int(base_height)
+    target_height = OUTPUT_RESOLUTION_HEIGHTS.get(normalize_output_resolution(resolution))
+    if not target_height or width <= 0 or height <= 0 or height <= target_height:
+        return width, height
+    target_width = int(round(width * target_height / height / 2.0)) * 2
+    return max(2, target_width), target_height
+
+
+def disable_tk_class_resize_redraw(hwnds):
+    """Clear CS_HREDRAW/CS_VREDRAW on Tk's window classes.
+
+    Tk registers TkTopLevel/TkChild with these styles, so Windows invalidates and repaints
+    every child window on each resize step. Tk already redraws its widgets on geometry
+    changes itself, so dropping the flags makes live resizing several times cheaper.
+    The class style is process-wide, so this only needs the HWNDs of one window.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        user32 = ctypes.windll.user32
+        get_class_long = user32.GetClassLongPtrW
+        set_class_long = user32.SetClassLongPtrW
+        get_class_long.restype = ctypes.c_size_t
+        get_class_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        set_class_long.restype = ctypes.c_size_t
+        set_class_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_size_t]
+    except (AttributeError, OSError):
+        return 0
+    gcl_style = -26
+    redraw_flags = 0x0001 | 0x0002  # CS_VREDRAW | CS_HREDRAW
+    changed = 0
+    for hwnd in hwnds:
+        if not hwnd:
+            continue
+        try:
+            style = int(get_class_long(hwnd, gcl_style))
+            if style & redraw_flags:
+                set_class_long(hwnd, gcl_style, style & ~redraw_flags)
+                changed += 1
+        except (OSError, ctypes.ArgumentError):
+            continue
+    return changed
+
+
+CLIP_GALLERY_GAP = 16
+CLIP_GALLERY_MIN_CARD_WIDTH = 340
+CLIP_GALLERY_MAX_COLUMNS = 4
+
+
+def clip_gallery_layout(available_width):
+    """Return (columns, card_width, thumb_width, thumb_height) for the clip gallery grid."""
+    width = max(1, int(available_width))
+    columns = (width + CLIP_GALLERY_GAP) // (CLIP_GALLERY_MIN_CARD_WIDTH + CLIP_GALLERY_GAP)
+    columns = max(1, min(CLIP_GALLERY_MAX_COLUMNS, columns))
+    card_width = max(1, (width - CLIP_GALLERY_GAP * (columns - 1)) // columns)
+    thumb_width = max(240, card_width - card_width % 16)
+    thumb_height = thumb_width * 9 // 16
+    thumb_height -= thumb_height % 2
+    return columns, card_width, thumb_width, thumb_height
 
 
 def normalize_video_encoder(value):
@@ -154,7 +233,9 @@ def recommended_video_bitrate_mbps(framerate, width, height, preset="high"):
     video_height = clamp_int(height, 240, 8192, 1080)
     preset_factor = AUTO_BITRATE_PRESET_FACTORS[normalize_auto_bitrate_preset(preset)]
     pixel_factor = (video_width * video_height) / float(1920 * 1080)
-    fps_factor = fps / 60.0
+    # Higher frame rates change less per frame, so the needed bitrate grows
+    # sub-linearly: 120 fps needs ~1.5x (not 2x) the 60 fps bitrate.
+    fps_factor = (fps / 60.0) ** 0.6
     bitrate = 35.0 * pixel_factor * fps_factor * preset_factor
     return max(5, min(300, int(round(bitrate))))
 
@@ -407,6 +488,7 @@ DEFAULT_CONFIG = {
     "monitor_index": 0,
     "window_title": "",
     "framerate": 60,
+    "output_resolution": "native",
     "clip_seconds": 30,
     "segment_seconds": 4,
     "video_encoder": "auto",
@@ -824,6 +906,39 @@ def media_kind_for_path(path):
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 BELOW_NORMAL_PRIORITY_CLASS = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+PROCESS_IO_PRIORITY_CLASS = 33
+PROCESS_PAGE_PRIORITY_CLASS = 39
+IO_PRIORITY_VERY_LOW = 0
+IO_PRIORITY_LOW = 1
+MEMORY_PRIORITY_VERY_LOW = 1
+
+
+def lower_process_io_priority(process):
+    """Put a child process into background I/O and memory priority.
+
+    Multi-GB remuxes otherwise compete with games, Discord and the desktop at
+    normal I/O priority and can stall the whole system for seconds."""
+    if os.name != "nt":
+        return False
+    handle = getattr(process, "_handle", None)
+    if not handle:
+        return False
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        set_info = ntdll.NtSetInformationProcess
+        set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG]
+        set_info.restype = ctypes.c_long
+        lowered = False
+        for io_priority in (IO_PRIORITY_VERY_LOW, IO_PRIORITY_LOW):
+            value = wintypes.ULONG(io_priority)
+            if set_info(int(handle), PROCESS_IO_PRIORITY_CLASS, ctypes.byref(value), ctypes.sizeof(value)) >= 0:
+                lowered = True
+                break
+        page_priority = wintypes.ULONG(MEMORY_PRIORITY_VERY_LOW)
+        set_info(int(handle), PROCESS_PAGE_PRIORITY_CLASS, ctypes.byref(page_priority), ctypes.sizeof(page_priority))
+        return lowered
+    except Exception:
+        return False
 ERROR_ALREADY_EXISTS = 183
 FO_DELETE = 3
 FOF_SILENT = 0x0004
@@ -2899,6 +3014,7 @@ class FfmpegManager:
         self.obs_capture_good_samples = 0
         self.obs_capture_recovery_pending_reset = False
         self.obs_capture_unresolved_logged = False
+        self.obs_advanced_output_disabled = False
         self.obs_record_watchdog_thread = None
         self.last_game_capture_label = ""
         self.last_game_capture_label_at = 0.0
@@ -2950,6 +3066,7 @@ class FfmpegManager:
             self.encoder_cache = None
             self.encoder_log_signature = None
             self.ffmpeg_encoder_names_cache = None
+            self.obs_advanced_output_disabled = False
         if bool(old_config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])) != bool(
             config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])
         ):
@@ -3284,8 +3401,76 @@ class FfmpegManager:
             return 0
         return int((bitrate * seconds) / 8)
 
+    def obs_output_size(self, base_width, base_height):
+        return scaled_output_size(
+            base_width,
+            base_height,
+            self.config.get("output_resolution", DEFAULT_CONFIG["output_resolution"]),
+        )
+
+    def obs_uses_advanced_output(self):
+        return not self.obs_advanced_output_disabled
+
+    def obs_record_encoder_settings(self, encoder):
+        """Encoder settings for OBS Advanced output, tuned for an always-on replay buffer."""
+        target_mbps, max_mbps, _buffer = self.video_bitrate_settings()
+        try:
+            quality = int(self.config.get("quality", DEFAULT_CONFIG["quality"]))
+        except (TypeError, ValueError):
+            quality = DEFAULT_CONFIG["quality"]
+        quality = max(15, min(35, quality))
+        target_mode = str(self.config.get("bitrate_mode", DEFAULT_CONFIG["bitrate_mode"])).casefold() == "target"
+        bitrate = target_mbps * 1000
+        max_bitrate = max_mbps * 1000
+        if encoder == "h264_nvenc":
+            return {
+                "rate_control": "VBR" if target_mode else "CQP",
+                "bitrate": bitrate,
+                "max_bitrate": max_bitrate,
+                "cqp": quality,
+                "keyint_sec": 2,
+                # p4 + no multipass/lookahead/AQ keeps the load on the NVENC block
+                # instead of extra CUDA passes (Simple mode forced p5 + AQ).
+                # obs-nvenc (OBS 31+) reads "preset"; "preset2" is the legacy key.
+                "preset": "p4",
+                "preset2": "p4",
+                "tune": "hq",
+                "multipass": "disabled",
+                "profile": "high",
+                "lookahead": False,
+                "adaptive_quantization": False,
+                "psycho_aq": False,
+            }
+        if encoder == "h264_amf":
+            return {
+                "rate_control": "VBR" if target_mode else "CQP",
+                "bitrate": bitrate,
+                "cqp": quality,
+                "keyint_sec": 2,
+                "preset": "balanced",
+                "profile": "high",
+            }
+        if encoder == "h264_qsv":
+            return {
+                "rate_control": "VBR" if target_mode else "CQP",
+                "bitrate": bitrate,
+                "max_bitrate": max_bitrate,
+                "cqp": quality,
+                "keyint_sec": 2,
+                "profile": "high",
+            }
+        return {
+            "rate_control": "CBR" if target_mode else "CRF",
+            "bitrate": bitrate,
+            "crf": quality,
+            "keyint_sec": 2,
+            "preset": "veryfast",
+            "profile": "high",
+        }
+
     def write_obs_capture_profile_config(self, obs_root):
         width, height = self.obs_video_size()
+        output_width, output_height = self.obs_output_size(width, height)
         fps = max(1, int(self.config.get("framerate", 60) or 60))
         output_dir = self.obs_output_dir()
         container = str(self.config.get("container", "mp4")).casefold()
@@ -3295,8 +3480,16 @@ class FfmpegManager:
         replay_buffer_mb = self.obs_replay_buffer_mb()
         encoder = self.resolve_video_encoder(ffmpeg_limited=False, log_selection=True)
         simple_encoder = OBS_SIMPLE_ENCODERS.get(encoder, "x264")
+        advanced_encoder = OBS_ADVANCED_ENCODERS.get(encoder, "obs_x264")
+        output_mode = "Advanced" if self.obs_uses_advanced_output() else "Simple"
         profile_dir = obs_root / "config" / "obs-studio" / "basic" / "profiles" / "ShadowClip"
         profile_dir.mkdir(parents=True, exist_ok=True)
+        # Advanced output re-reads this file every time the replay buffer or
+        # recording is set up, so bitrate/preset changes apply on next start.
+        (profile_dir / "recordEncoder.json").write_text(
+            json.dumps(self.obs_record_encoder_settings(encoder), indent=2),
+            encoding="utf-8",
+        )
         global_ini = obs_root / "config" / "obs-studio" / "global.ini"
         global_ini.parent.mkdir(parents=True, exist_ok=True)
         global_ini.write_text(
@@ -3311,7 +3504,7 @@ class FfmpegManager:
 Name=ShadowClip
 
 [Output]
-Mode=Simple
+Mode={output_mode}
 FilenameFormatting=%CCYY-%MM-%DD_%hh-%mm-%ss
 DelayEnable=false
 DelaySec=20
@@ -3331,7 +3524,7 @@ VBitrate={bitrate}
 ABitrate=160
 UseAdvanced=false
 Preset=veryfast
-NVENCPreset2=p5
+NVENCPreset2=p4
 RecQuality=Small
 RecRB=true
 RecRBTime={clip_seconds}
@@ -3354,7 +3547,7 @@ RecFilePath={self.obs_ini_path(output_dir)}
 RecFormat2={obs_format}
 RecUseRescale=false
 RecTracks=1
-RecEncoder=none
+RecEncoder={advanced_encoder}
 FLVTrack=1
 StreamMultiTrackAudioMixes=1
 FFOutputToFile=true
@@ -3383,8 +3576,8 @@ RecAudioEncoder=ffmpeg_aac
 [Video]
 BaseCX={width}
 BaseCY={height}
-OutputCX={width}
-OutputCY={height}
+OutputCX={output_width}
+OutputCY={output_height}
 FPSType=2
 FPSCommon={fps}
 FPSInt={fps}
@@ -3430,11 +3623,12 @@ PeakMeterType=0
 
     def set_obs_video_settings_for_size(self, client, width, height):
         fps = max(1, int(self.config.get("framerate", 60) or 60))
+        output_width, output_height = self.obs_output_size(width, height)
         client.request("SetVideoSettings", {
             "baseWidth": int(width),
             "baseHeight": int(height),
-            "outputWidth": int(width),
-            "outputHeight": int(height),
+            "outputWidth": int(output_width),
+            "outputHeight": int(output_height),
             "fpsNumerator": fps,
             "fpsDenominator": 1,
         })
@@ -3450,6 +3644,14 @@ PeakMeterType=0
                 return False
             time.sleep(0.15)
         return not self.obs_replay_buffer_active(client)
+
+    def wait_for_obs_record_active(self, client, timeout=5.0):
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            if self.obs_recording_active(client):
+                return True
+            time.sleep(0.15)
+        return self.obs_recording_active(client)
 
     def wait_for_obs_replay_buffer_active(self, client, timeout=5.0):
         deadline = time.time() + float(timeout)
@@ -3530,9 +3732,20 @@ PeakMeterType=0
                 return monitor_id
         return monitor_device_name_for_index(0)
 
-    def obs_display_input_settings(self, context=None, method=None):
+    def obs_display_capture_method(self, base_mode=None):
+        """0 = OBS Automatic (DXGI duplication, WGC only when cross-adapter), 2 = WGC."""
+        strategy = self.obs_capture_strategy
+        if strategy in {"display_wgc", "game_window_wgc"}:
+            return 2
+        if strategy == "overlay_wgc":
+            # The WGC overlay layer only matters above a game. Plain desktop and
+            # browser capture use the much cheaper DXGI path.
+            return 2 if base_mode in OBS_GAME_BASE_MODES else 0
+        return 0
+
+    def obs_display_input_settings(self, context=None, method=None, base_mode=None):
         if method is None:
-            method = 2 if self.obs_capture_strategy in {"display_wgc", "game_window_wgc", "overlay_wgc"} else 0
+            method = self.obs_display_capture_method(base_mode)
         settings = {
             "capture_cursor": True,
             "method": int(method),
@@ -3543,8 +3756,8 @@ PeakMeterType=0
             settings["monitor_id"] = monitor_id
         return settings
 
-    def update_obs_display_input_settings(self, client, context=None, force=False):
-        settings = self.obs_display_input_settings(context)
+    def update_obs_display_input_settings(self, client, context=None, force=False, base_mode=None):
+        settings = self.obs_display_input_settings(context, base_mode=base_mode)
         monitor_id = str(settings.get("monitor_id") or "")
         signature = json.dumps(settings, sort_keys=True, ensure_ascii=False)
         # Reapplying identical live WGC settings can race win-capture's render
@@ -3818,14 +4031,14 @@ PeakMeterType=0
         self.prepare_obs_capture_context(context)
         use_game_capture = self.obs_strategy_uses_game_capture(base_mode)
         specific_window = self.obs_strategy_uses_specific_window(base_mode)
-        display_method = 2 if self.obs_capture_strategy in {"display_wgc", "game_window_wgc", "overlay_wgc"} else 0
+        display_method = self.obs_display_capture_method(base_mode)
         display_enabled = self.obs_capture_strategy != "game_only"
         overlay_primary = self.obs_capture_strategy == "overlay_wgc" and use_game_capture
         mode = f"{base_mode}:{self.obs_capture_strategy}"
         if not force and mode == self.obs_scene_capture_mode:
             try:
                 if display_enabled:
-                    self.update_obs_display_input_settings(client, context=context)
+                    self.update_obs_display_input_settings(client, context=context, base_mode=base_mode)
                 if use_game_capture:
                     self.update_obs_game_input_settings(client, context=context, minecraft_specific=specific_window)
                 if display_enabled:
@@ -3838,7 +4051,7 @@ PeakMeterType=0
 
         try:
             if display_enabled:
-                self.update_obs_display_input_settings(client, context=context, force=True)
+                self.update_obs_display_input_settings(client, context=context, force=True, base_mode=base_mode)
             if use_game_capture:
                 self.update_obs_game_input_settings(
                     client,
@@ -3904,7 +4117,12 @@ PeakMeterType=0
             ("SimpleOutput", "RecRB", "true"),
             ("SimpleOutput", "RecRBTime", str(clip_seconds)),
             ("SimpleOutput", "RecRBSize", str(replay_buffer_mb)),
-            ("Output", "Mode", "Simple"),
+            ("AdvOut", "RecFilePath", output_dir),
+            ("AdvOut", "RecFormat2", obs_format),
+            ("AdvOut", "RecRB", "true"),
+            ("AdvOut", "RecRBTime", str(clip_seconds)),
+            ("AdvOut", "RecRBSize", str(replay_buffer_mb)),
+            ("Output", "Mode", "Advanced" if self.obs_uses_advanced_output() else "Simple"),
         ]:
             try:
                 client.request("SetProfileParameter", {
@@ -3945,7 +4163,7 @@ PeakMeterType=0
         initial_use_game_capture = self.obs_strategy_uses_game_capture(initial_base_mode)
         initial_specific_window = self.obs_strategy_uses_specific_window(initial_base_mode)
         initial_display_enabled = self.obs_capture_strategy != "game_only"
-        display_settings = self.obs_display_input_settings(initial_context)
+        display_settings = self.obs_display_input_settings(initial_context, base_mode=initial_base_mode)
         if self.obs_display_input_name not in input_names:
             try:
                 client.request("CreateInput", {
@@ -3961,7 +4179,9 @@ PeakMeterType=0
             except Exception as exc:
                 self.warn_once("obs_monitor_fallback", f"OBS monitor fallback setup failed: {exc}")
         elif initial_display_enabled:
-            self.update_obs_display_input_settings(client, context=initial_context, force=True)
+            self.update_obs_display_input_settings(
+                client, context=initial_context, force=True, base_mode=initial_base_mode
+            )
 
         settings = self.obs_game_input_settings(
             context=initial_context,
@@ -4098,13 +4318,36 @@ PeakMeterType=0
         # OpenGL hook reconnect at win-capture.dll + 0x9D4B.
         return None
 
+    def run_obs_start_with_output_fallback(self, label, start, other_output_running):
+        """Run an OBS output start; if Advanced output fails, retry once in Simple mode.
+
+        Simple mode lets OBS substitute x264 when the selected hardware encoder
+        is missing, which Advanced output does not do."""
+        try:
+            return start()
+        except Exception as exc:
+            if not self.obs_uses_advanced_output() or other_output_running:
+                raise
+            self.obs_advanced_output_disabled = True
+            self.log(
+                f"OBS {label} failed with the advanced encoder setup ({exc}). "
+                "Restarting OBS with the simple output fallback."
+            )
+            self.stop_obs_runtime()
+            return start()
+
     def start_obs_replay(self, preserve_buffer=False, from_watchdog=False):
-        client = self.configure_obs_for_capture()
+        def start():
+            client = self.configure_obs_for_capture()
+            self.start_obs_replay_buffer_with_retry(client)
+            return client
+
+        recording_running = bool(self.record_proc and self.record_proc.poll() is None)
         if not preserve_buffer:
             self.last_clip_saved_at = 0.0
             self.replay_backend_override = None
             self.replay_restart_count = 0
-        self.start_obs_replay_buffer_with_retry(client)
+        self.run_obs_start_with_output_fallback("replay start", start, recording_running)
         self.replay_proc = VirtualProcess("obs replay")
         self.replay_active_backend = "obs"
         self.replay_should_restart = True
@@ -4262,10 +4505,19 @@ PeakMeterType=0
         if self.record_proc and self.record_proc.poll() is None:
             self.log("Recording already running.")
             return
-        client = self.configure_obs_for_capture()
-        status = client.request("GetRecordStatus")
-        if not status.get("outputActive"):
-            client.request("StartRecord")
+        def start():
+            client = self.configure_obs_for_capture()
+            status = client.request("GetRecordStatus")
+            if not status.get("outputActive"):
+                client.request("StartRecord")
+                if self.obs_uses_advanced_output() and not self.wait_for_obs_record_active(client):
+                    raise RuntimeError("OBS recording did not become active after StartRecord.")
+            return client
+
+        replay_running = bool(
+            self.replay_active_backend == "obs" and self.replay_proc and self.replay_proc.poll() is None
+        )
+        self.run_obs_start_with_output_fallback("recording start", start, replay_running)
         self.record_proc = VirtualProcess("obs recording")
         self.recording_active_backend = "obs"
         self.recording_started_at = time.time()
@@ -5110,7 +5362,7 @@ PeakMeterType=0
         if encoder == "h264_nvenc":
             args = [
                 "-c:v", "h264_nvenc",
-                "-preset", "p5",
+                "-preset", "p4",
                 "-bf", "0",
             ]
             if bitrate_mode == "target":
@@ -5259,14 +5511,17 @@ PeakMeterType=0
         ]
         try:
             with log_path.open("w", encoding="utf-8") as log_handle:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     command,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=log_handle,
                     creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
                 )
-            if result.returncode != 0 or not temp_path.exists():
-                raise RuntimeError(f"FFmpeg exited with code {result.returncode}. See log: {log_path}")
+                lower_process_io_priority(process)
+                returncode = process.wait()
+            if returncode != 0 or not temp_path.exists():
+                raise RuntimeError(f"FFmpeg exited with code {returncode}. See log: {log_path}")
             if not self.has_video_stream(temp_path):
                 raise RuntimeError(f"Finalized file has no video stream. See log: {log_path}")
             if source_has_audio and not self.has_audio_stream(temp_path):
@@ -6505,6 +6760,8 @@ class ShadowClipApp:
         self.clip_library_last_scan_at = 0.0
         self.clip_library_render_limit = 24
         self.clip_library_columns = 0
+        self.clip_gallery_thumb_size = (360, 202)
+        self.ui_debounce_after_ids = {}
         self.clip_library_render_after_id = None
         self.clip_gallery_thumbnail_queue = queue.Queue()
         self.clip_gallery_thumbnail_pending = set()
@@ -6594,6 +6851,7 @@ class ShadowClipApp:
             "monitor_index": tk.IntVar(value=int(self.config.get("monitor_index", 0))),
             "window_title": tk.StringVar(value=self.config.get("window_title", "")),
             "framerate": tk.IntVar(value=int(self.config.get("framerate", 60))),
+            "output_resolution": tk.StringVar(value=normalize_output_resolution(self.config.get("output_resolution", DEFAULT_CONFIG["output_resolution"]))),
             "clip_seconds": tk.IntVar(value=int(self.config.get("clip_seconds", 60))),
             "segment_seconds": tk.IntVar(value=int(self.config.get("segment_seconds", 4))),
             "video_encoder": tk.StringVar(value=self.config.get("video_encoder", "auto")),
@@ -6976,6 +7234,7 @@ class ShadowClipApp:
             user32 = ctypes.windll.user32
             dwmapi = ctypes.windll.dwmapi
             hwnd = user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            disable_tk_class_resize_redraw((hwnd, self.root.winfo_id()))
             enabled = ctypes.c_int(1)
             for attribute in (20, 19):
                 try:
@@ -7719,6 +7978,12 @@ class ShadowClipApp:
         page = getattr(self, "pages", {}).get(page_key)
         if not page:
             return
+        # Only the visible page stays gridded: stacked pages would all be re-laid out
+        # on every window resize, which made dragging the window edge stutter.
+        for key, other in getattr(self, "pages", {}).items():
+            if key != page_key:
+                other.grid_remove()
+        page.grid()
         page.tkraise()
         self.active_page = page_key
         colors = self.ui_colors
@@ -7739,6 +8004,8 @@ class ShadowClipApp:
         self.update_status_bar()
         if page_key == "clips":
             self.root.after(0, lambda: self.refresh_clip_library(force=False))
+        elif page_key == "home":
+            self.debounce_ui("home_last_clip_preview", 60, self.render_last_clip_preview)
 
     def create_nav_button(self, parent, key, label):
         colors = self.ui_colors
@@ -7793,11 +8060,21 @@ class ShadowClipApp:
         self.configure_dark_theme()
         colors = self.ui_colors
         root.configure(bg=colors["bg"])
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
-        root.rowconfigure(1, weight=0)
+        # Everything lives in a placed host frame so that live window resizing only
+        # re-lays out the (expensive) widget tree a few times per second instead of
+        # on every pixel of the drag; see on_root_configure_for_layout.
+        layout_host = tk.Frame(root, bg=colors["bg"])
+        layout_host.place(x=0, y=0, relwidth=1, relheight=1)
+        self.layout_host = layout_host
+        self.layout_host_size = None
+        self.layout_host_frozen = False
+        self.layout_host_last_apply_at = 0.0
+        layout_host.columnconfigure(0, weight=1)
+        layout_host.rowconfigure(0, weight=1)
+        layout_host.rowconfigure(1, weight=0)
+        root.bind("<Configure>", self.on_root_configure_for_layout, add="+")
 
-        shell = tk.Frame(root, bg=colors["bg"])
+        shell = tk.Frame(layout_host, bg=colors["bg"])
         shell.grid(row=0, column=0, sticky="nsew")
         shell.columnconfigure(1, weight=1)
         shell.rowconfigure(0, weight=1)
@@ -7869,7 +8146,7 @@ class ShadowClipApp:
             self.pages[key] = page
             builder(page)
 
-        bottom = tk.Frame(root, bg=colors["bg_soft"], height=58, highlightbackground=colors["border_soft"], highlightthickness=1)
+        bottom = tk.Frame(layout_host, bg=colors["bg_soft"], height=58, highlightbackground=colors["border_soft"], highlightthickness=1)
         bottom.grid(row=1, column=0, sticky="ew")
         bottom.grid_propagate(False)
         bottom.columnconfigure(0, weight=1)
@@ -7981,7 +8258,7 @@ class ShadowClipApp:
         preview.grid(row=1, column=0, sticky="nsew", padx=(20, 14), pady=(0, 16))
         preview.configure(cursor="hand2")
         preview.bind("<Button-1>", lambda _event: self.open_last_clip(), add="+")
-        preview.bind("<Configure>", lambda _event: self.render_last_clip_preview(), add="+")
+        preview.bind("<Configure>", lambda _event: self.debounce_ui("home_last_clip_preview", 250, self.render_last_clip_preview), add="+")
         self.home_last_clip_preview = preview
         self.draw_last_clip_placeholder()
         info = tk.Frame(last_clip, bg=colors["panel"])
@@ -8280,7 +8557,9 @@ class ShadowClipApp:
         except tk.TclError:
             return
         if width <= 240 and height <= 120:
-            self.root.after(120, self.render_last_clip_preview)
+            # Hidden pages are unmapped; show_main_page re-renders when Home becomes visible.
+            if canvas.winfo_ismapped():
+                self.debounce_ui("home_last_clip_preview", 120, self.render_last_clip_preview)
             return
         signature = self.thumbnail_signature_for_clip(clip, width, height)
         if signature == getattr(self, "home_last_clip_preview_signature", None):
@@ -8488,10 +8767,84 @@ class ShadowClipApp:
             canvas.itemconfigure(self.clip_gallery_window, width=max(1, int(event.width)))
         except tk.TclError:
             return
-        columns = 3 if event.width >= 1080 else 2 if event.width >= 690 else 1
-        if columns != self.clip_library_columns:
+        width = int(event.width)
+        if not self.clip_library_columns:
+            self.apply_clip_gallery_layout(width)
+            return
+        # Rebuilding every card while the window edge is being dragged makes resizing stutter,
+        # so only re-layout once the size has settled.
+        self.debounce_ui("clip_gallery_layout", 220, lambda: self.apply_clip_gallery_layout(width))
+
+    def apply_clip_gallery_layout(self, width):
+        columns, _card_width, thumb_width, thumb_height = clip_gallery_layout(width)
+        thumb_size = (thumb_width, thumb_height)
+        if columns != self.clip_library_columns or thumb_size != self.clip_gallery_thumb_size:
             self.clip_library_columns = columns
+            self.clip_gallery_thumb_size = thumb_size
             self.schedule_clip_library_filter(reset_limit=False)
+
+    LIVE_RESIZE_SETTLE_MS = 90
+    LIVE_RESIZE_MAX_INTERVAL_S = 0.25
+
+    def on_root_configure_for_layout(self, event):
+        if event.widget is not self.root:
+            return
+        host = getattr(self, "layout_host", None)
+        if host is None:
+            return
+        size = (int(event.width), int(event.height))
+        if size == self.layout_host_size:
+            return
+        try:
+            host_width, host_height = host.winfo_width(), host.winfo_height()
+        except tk.TclError:
+            return
+        if self.layout_host_size is None or host_width <= 1 or host_height <= 1:
+            # First layout (startup): follow the window directly.
+            self.apply_layout_host_size(size)
+            return
+        if not self.layout_host_frozen:
+            # Pin the content to its current size; the pending relayout of the whole
+            # widget tree is skipped until the size is applied below.
+            self.layout_host_frozen = True
+            host.place_configure(relwidth=0, relheight=0, width=host_width, height=host_height)
+        if time.monotonic() - self.layout_host_last_apply_at >= self.LIVE_RESIZE_MAX_INTERVAL_S:
+            self.apply_layout_host_size(size, keep_frozen=True)
+        self.debounce_ui("layout_host_resize", self.LIVE_RESIZE_SETTLE_MS, lambda: self.apply_layout_host_size(size))
+
+    def apply_layout_host_size(self, size, keep_frozen=False):
+        host = getattr(self, "layout_host", None)
+        if host is None:
+            return
+        self.layout_host_size = size
+        self.layout_host_last_apply_at = time.monotonic()
+        try:
+            if keep_frozen:
+                host.place_configure(relwidth=0, relheight=0, width=size[0], height=size[1])
+            else:
+                self.layout_host_frozen = False
+                host.place_configure(relwidth=1, relheight=1, width=0, height=0)
+        except tk.TclError:
+            pass
+
+    def debounce_ui(self, key, delay_ms, callback):
+        if not hasattr(self, "ui_debounce_after_ids"):
+            self.ui_debounce_after_ids = {}
+        pending = self.ui_debounce_after_ids.pop(key, None)
+        if pending:
+            try:
+                self.root.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+
+        def run():
+            self.ui_debounce_after_ids.pop(key, None)
+            try:
+                callback()
+            except tk.TclError:
+                pass
+
+        self.ui_debounce_after_ids[key] = self.root.after(int(delay_ms), run)
 
     def scroll_clip_gallery(self, event):
         canvas = getattr(self, "clip_gallery_canvas", None)
@@ -8634,9 +8987,12 @@ class ShadowClipApp:
             child.destroy()
         self.clip_gallery_card_canvases = {}
         self.clip_gallery_metadata_labels = {}
-        columns = max(1, self.clip_library_columns or 3)
+        columns = max(1, self.clip_library_columns or 2)
         for column in range(columns):
-            grid.columnconfigure(column, weight=1, uniform="clip_cards")
+            grid.columnconfigure(column, weight=1, uniform="clip_cards", minsize=0)
+        # Columns left over from a wider layout would otherwise keep reserving empty space.
+        for column in range(columns, CLIP_GALLERY_MAX_COLUMNS + 4):
+            grid.columnconfigure(column, weight=0, uniform="", minsize=0)
         items = self.clip_library_filtered[:self.clip_library_render_limit]
         if hasattr(self, "clip_library_summary"):
             self.clip_library_summary.configure(text=self.clip_library_summary_text(len(items)))
@@ -8676,7 +9032,7 @@ class ShadowClipApp:
         colors = self.ui_colors
         card = self.dashboard_panel(parent)
         card.columnconfigure(0, weight=1)
-        preview = tk.Canvas(card, bg="#090d13", height=203, highlightthickness=0, bd=0, cursor="hand2")
+        preview = tk.Canvas(card, bg="#090d13", height=self.clip_gallery_thumb_size[1], highlightthickness=0, bd=0, cursor="hand2")
         preview.grid(row=0, column=0, sticky="ew")
         preview._shadowclip_path_key = item["path_key"]
         preview._shadowclip_placeholder = "Generating preview..."
@@ -8743,7 +9099,8 @@ class ShadowClipApp:
             pass
 
     def queue_clip_gallery_media(self, item, canvas, metadata_label):
-        signature = self.thumbnail_signature_for_clip(item["path"], 360, 203)
+        thumb_width, thumb_height = self.clip_gallery_thumb_size
+        signature = self.thumbnail_signature_for_clip(item["path"], thumb_width, thumb_height)
         thumbnail_path = self.thumbnail_path_for_signature(signature)
         key = item["path_key"]
         self.clip_gallery_card_canvases[key] = (canvas, signature, thumbnail_path)
@@ -8779,7 +9136,7 @@ class ShadowClipApp:
             metadata = {}
             try:
                 if not Path(thumbnail_path).exists():
-                    self.create_video_thumbnail(item["path"], thumbnail_path, 360, 203)
+                    self.create_video_thumbnail(item["path"], thumbnail_path, signature[3], signature[4])
                 metadata = self.probe_clip_library_media(item["path"])
             except Exception as exc:
                 error = str(exc)
@@ -9679,6 +10036,8 @@ class ShadowClipApp:
         ttk.Spinbox(body, from_=15, to=35, increment=1, textvariable=self.vars["quality"], width=10, style="Modern.TSpinbox").grid(row=3, column=1, sticky="e", padx=(12, 0), pady=5)
         self.settings_field_label(body, "Container", "MKV is resilient; MP4 has broad compatibility.", 4, 0)
         ttk.Combobox(body, state="readonly", textvariable=self.vars["container"], values=["mkv", "mp4"], width=10, style="Modern.TCombobox").grid(row=4, column=1, sticky="e", padx=(12, 0), pady=5)
+        self.settings_field_label(body, "Output resolution", "Downscale the OBS output to save GPU encoder load.", 5, 0)
+        ttk.Combobox(body, state="readonly", textvariable=self.vars["output_resolution"], values=OUTPUT_RESOLUTION_VALUES, width=10, style="Modern.TCombobox").grid(row=5, column=1, sticky="e", padx=(12, 0), pady=5)
 
         encoder, encoder_body = self.create_settings_panel(content, "Encoder and bitrate", "Hardware encoding is selected automatically when available.", "encoder")
         encoder.grid(row=0, column=1, sticky="nsew", padx=(9, 0), pady=(0, 18))
@@ -10996,7 +11355,7 @@ class ShadowClipApp:
         ]
         for key in watched:
             self.vars[key].trace_add("write", lambda *args: self.refresh_status_panel())
-        for key in ("framerate", "capture_mode", "capture_backend", "monitor_index", "auto_video_bitrate", "auto_bitrate_preset"):
+        for key in ("framerate", "output_resolution", "capture_mode", "capture_backend", "monitor_index", "auto_video_bitrate", "auto_bitrate_preset"):
             self.vars[key].trace_add("write", self.sync_auto_video_bitrate)
         for key in ("clip_seconds", "video_bitrate_mbps", "obs_replay_ram_auto"):
             self.vars[key].trace_add("write", self.sync_auto_obs_replay_buffer)
@@ -11023,13 +11382,17 @@ class ShadowClipApp:
             index = 0
         index = max(0, min(index, len(monitors) - 1))
         monitor = monitors[index]
-        return int(monitor["width"]), int(monitor["height"])
+        width, height = int(monitor["width"]), int(monitor["height"])
+        if backend == "obs":
+            width, height = scaled_output_size(width, height, config.get("output_resolution"))
+        return width, height
 
     def video_dimensions_for_bitrate(self):
         return self.video_dimensions_for_config({
             "capture_mode": self.vars["capture_mode"].get(),
             "capture_backend": self.vars["capture_backend"].get(),
             "monitor_index": self.vars["monitor_index"].get(),
+            "output_resolution": self.vars["output_resolution"].get(),
         })
 
     def calculated_auto_video_bitrate(self):
@@ -11371,6 +11734,7 @@ class ShadowClipApp:
             config.get("capture_desktop_overlays", DEFAULT_CONFIG["capture_desktop_overlays"])
         )
         config["capture_desktop_overlays_migrated"] = True
+        config["output_resolution"] = normalize_output_resolution(config.get("output_resolution"))
         if config["capture_desktop_overlays"]:
             config["capture_backend"] = "obs"
             self.vars["capture_backend"].set("obs")
@@ -14184,6 +14548,8 @@ class ShadowClipApp:
         self.overlay_combo(section, self.vars["video_encoder"], VIDEO_ENCODER_VALUES, 3, 3)
         self.overlay_label(section, ui_text("container", "Container"), 4, 0)
         self.overlay_combo(section, self.vars["container"], ["mkv", "mp4"], 4, 1, width=8)
+        self.overlay_label(section, ui_text("video", "Output resolution"), 4, 2)
+        self.overlay_combo(section, self.vars["output_resolution"], OUTPUT_RESOLUTION_VALUES, 4, 3, width=10)
         self.overlay_check(section, "Auto bitrate", self.vars["auto_video_bitrate"], 5, 0, columnspan=2)
         self.overlay_label(section, ui_text("quality", "Preset"), 5, 2)
         self.auto_bitrate_preset_combo_overlay = self.overlay_combo(section, self.vars["auto_bitrate_preset"], AUTO_BITRATE_PRESETS, 5, 3, width=12)
